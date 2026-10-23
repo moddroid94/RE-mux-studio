@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tar \
     gzip \
     ca-certificates \
+    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # Download and install N_m3u8DL-RE binary for Linux x64

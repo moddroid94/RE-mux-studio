@@ -19,7 +19,12 @@ interface ActiveJobInternal {
   intervalTimer?: NodeJS.Timeout;
 }
 
+type JobProgressLambda = (job: DownloadJob) => void;
+type GlobalProgressLambda = () => void;
+
 const activeJobsStore: Map<string, ActiveJobInternal> = new Map();
+const jobProgressListenerMap: Map<string, Set<JobProgressLambda>> = new Map();
+const globalProgressListeners: Set<GlobalProgressLambda> = new Set();
 
 // Ensure downloads directory exists
 const DOWNLOADS_DIR = path.resolve('./downloads');
@@ -42,6 +47,15 @@ const HAS_FFMPEG = checkSystemBinary('ffmpeg');
 
 console.log(`[RE-Mux System Check] N_m3u8DL-RE Binary: ${HAS_NM3U8DL ? 'INSTALLED' : 'NOT FOUND (Docker mode)'}`);
 console.log(`[RE-Mux System Check] FFmpeg Binary: ${HAS_FFMPEG ? 'INSTALLED' : 'NOT FOUND (Docker mode)'}`);
+
+// Notify all registered progress lambdas
+function notifyJobProgress(job: DownloadJob) {
+  const listeners = jobProgressListenerMap.get(job.id);
+  if (listeners) {
+    listeners.forEach((cb) => cb(job));
+  }
+  globalProgressListeners.forEach((cb) => cb());
+}
 
 async function startServer() {
   const app = express();
@@ -181,7 +195,10 @@ async function startServer() {
       const internalJob: ActiveJobInternal = { job: newJob };
       activeJobsStore.set(jobId, internalJob);
 
-      runDownloadProcess(jobId, url, commandExecuted, commandConfig, outputFilename);
+      // Launch process with callback lambda for instant progress reporting
+      runDownloadProcess(jobId, url, commandExecuted, commandConfig, outputFilename, (updatedJob) => {
+        notifyJobProgress(updatedJob);
+      });
 
       return res.json({ success: true, job: newJob });
     } catch (err: any) {
@@ -208,9 +225,15 @@ async function startServer() {
     };
 
     sendAllJobs();
-    const interval = setInterval(sendAllJobs, 1000);
+
+    // Register callback lambda for instant global progress updates
+    const globalProgressLambda = () => sendAllJobs();
+    globalProgressListeners.add(globalProgressLambda);
+
+    const interval = setInterval(sendAllJobs, 2000);
 
     req.on('close', () => {
+      globalProgressListeners.delete(globalProgressLambda);
       clearInterval(interval);
     });
   });
@@ -229,14 +252,23 @@ async function startServer() {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
-    const sendUpdate = () => {
-      res.write(`data: ${JSON.stringify({ job: item.job })}\n\n`);
+    const sendJobUpdate = (updatedJob: DownloadJob) => {
+      res.write(`data: ${JSON.stringify({ job: updatedJob })}\n\n`);
     };
 
-    sendUpdate();
-    const timer = setInterval(sendUpdate, 1000);
+    sendJobUpdate(item.job);
+
+    // Register callback lambda for instant per-job progress updates
+    if (!jobProgressListenerMap.has(jobId)) {
+      jobProgressListenerMap.set(jobId, new Set());
+    }
+    const jobListeners = jobProgressListenerMap.get(jobId)!;
+    jobListeners.add(sendJobUpdate);
+
+    const timer = setInterval(() => sendJobUpdate(item.job), 2000);
 
     req.on('close', () => {
+      jobListeners.delete(sendJobUpdate);
       clearInterval(timer);
     });
   });
@@ -273,13 +305,16 @@ async function startServer() {
       item.job.error = 'Cancelled by user';
       item.job.currentSpeedBps = 0;
       addLog(item.job, 'error', '[Process] Execution terminated by user (SIGINT)');
+      notifyJobProgress(item.job);
     } else if (action === 'pause') {
       item.job.status = 'paused';
       item.job.currentSpeedBps = 0;
       addLog(item.job, 'warn', '[Process] Download task paused by user');
+      notifyJobProgress(item.job);
     } else if (action === 'resume') {
       item.job.status = 'downloading_video';
       addLog(item.job, 'info', '[Process] Download task resumed');
+      notifyJobProgress(item.job);
     }
 
     return res.json({ success: true, job: item.job });
@@ -452,13 +487,14 @@ function mergeTracks<T extends { id: string }>(existing: T[], cliDiscovered: T[]
   return merged;
 }
 
-// Real Process Execution Engine
+// Real Process Execution Engine with Callback Lambda Reporting
 function runDownloadProcess(
   jobId: string,
   url: string,
   commandExecuted: string,
   commandConfig: any,
-  outputFilename: string
+  outputFilename: string,
+  onProgressUpdate?: (job: DownloadJob) => void
 ) {
   const item = activeJobsStore.get(jobId);
   if (!item) return;
@@ -466,8 +502,17 @@ function runDownloadProcess(
   const job = item.job;
   const binaryToUse = HAS_NM3U8DL ? (checkSystemBinary('N_m3u8DL-RE') ? 'N_m3u8DL-RE' : 'm3u8dl-re') : null;
 
+  // Callback helper lambda
+  const reportProgress = () => {
+    notifyJobProgress(job);
+    if (onProgressUpdate) {
+      onProgressUpdate(job);
+    }
+  };
+
   if (binaryToUse) {
     addLog(job, 'info', `[RE-Mux Execution] Spawning binary: ${binaryToUse}`);
+    reportProgress();
 
     const rawArgs = parseArgsFromCommandString(commandExecuted, binaryToUse);
 
@@ -477,16 +522,39 @@ function runDownloadProcess(
       rawArgs.push('--ui-language', 'en-US');
     }
 
+    const hasScript = checkSystemBinary('script');
+    let spawnCmd = binaryToUse;
+    let spawnArgs = rawArgs;
+
+    if (hasScript) {
+      const esc = (arg: string) => {
+        if (/[\s"'$`\\]/.test(arg)) {
+          return `'${arg.replace(/'/g, "'\\''")}'`;
+        }
+        return arg;
+      };
+      const fullCmdString = `${binaryToUse} ${rawArgs.map(esc).join(' ')}`;
+      spawnCmd = 'script';
+      spawnArgs = ['-q', '-c', fullCmdString, '/dev/null'];
+    }
+
     try {
-      const child = spawn(binaryToUse, rawArgs, { cwd: DOWNLOADS_DIR });
+      const child = spawn(spawnCmd, spawnArgs, {
+        cwd: DOWNLOADS_DIR,
+        env: {
+          ...process.env,
+          TERM: 'xterm-256color',
+          COLUMNS: '160',
+          LINES: '50',
+        },
+      });
       item.process = child;
 
-      // Close stdin immediately so N_m3u8DL-RE never hangs waiting for keypress prompts
       child.stdin?.end();
 
       job.status = 'downloading_video';
+      reportProgress();
 
-      // Custom Chunk Stream Handler splitting on both \r and \n (Carriage Return Carriage Control)
       let stdoutBuffer = '';
       let stderrBuffer = '';
 
@@ -496,7 +564,6 @@ function runDownloadProcess(
 
         addLog(job, cleanLine.toLowerCase().includes('mux') ? 'muxer' : 'info', cleanLine);
 
-        // Detect stages
         if (cleanLine.includes('Downloading video') || cleanLine.includes('Segment')) {
           job.status = 'downloading_video';
         } else if (cleanLine.includes('Downloading audio')) {
@@ -507,14 +574,14 @@ function runDownloadProcess(
           job.status = 'muxing';
         }
 
-        // Match Percentage: "45.2%" or "45%"
+        // Percentage
         const percentMatch = cleanLine.match(/([\d.]+)%/);
         if (percentMatch) {
           const pct = parseFloat(percentMatch[1]);
           job.progress = Math.min(99, Math.round(pct));
         }
 
-        // Match Segments: "452/1000" or "452 / 1000"
+        // Segment counts
         const segMatch = cleanLine.match(/(\d+)\s*\/\s*(\d+)/);
         if (segMatch) {
           job.currentSegment = parseInt(segMatch[1], 10);
@@ -524,7 +591,7 @@ function runDownloadProcess(
           }
         }
 
-        // Match Speed: "24.5 MB/s" or "1200 KB/s" or "18.2MiB/s"
+        // Speed
         const speedMatch = cleanLine.match(/([\d.]+)\s*(MB\/s|MiB\/s|KB\/s|KiB\/s)/i);
         if (speedMatch) {
           const val = parseFloat(speedMatch[1]);
@@ -535,9 +602,11 @@ function runDownloadProcess(
           job.speedHistory.push(job.currentSpeedBps);
           if (job.speedHistory.length > 20) job.speedHistory.shift();
         }
+
+        // Invoke callback lambda on every line parsed
+        reportProgress();
       };
 
-      // Process stdout chunks splitting on \r\n, \r, and \n
       child.stdout?.on('data', (chunk: Buffer) => {
         stdoutBuffer += chunk.toString('utf8');
         const lines = stdoutBuffer.split(/\r\n|\r|\n/);
@@ -545,7 +614,6 @@ function runDownloadProcess(
         for (const l of lines) handleLine(l);
       });
 
-      // Process stderr chunks splitting on \r\n, \r, and \n
       child.stderr?.on('data', (chunk: Buffer) => {
         stderrBuffer += chunk.toString('utf8');
         const lines = stderrBuffer.split(/\r\n|\r|\n/);
@@ -554,7 +622,6 @@ function runDownloadProcess(
       });
 
       child.on('close', (code) => {
-        // Flush remaining buffer
         if (stdoutBuffer.trim()) handleLine(stdoutBuffer);
         if (stderrBuffer.trim()) handleLine(stderrBuffer);
 
@@ -568,26 +635,30 @@ function runDownloadProcess(
           job.error = `Process exited with code ${code}`;
           addLog(job, 'error', `[ERROR] Process exited with non-zero status code ${code}`);
         }
+        reportProgress();
       });
 
       child.on('error', (err) => {
         job.status = 'failed';
         job.error = err.message;
         addLog(job, 'error', `[ERROR] Failed to launch binary process: ${err.message}`);
+        reportProgress();
       });
 
       return;
     } catch (spawnErr: any) {
       addLog(job, 'warn', `[Spawn Error] Could not launch native process: ${spawnErr.message}`);
+      reportProgress();
     }
   }
 
-  // Simulation Runner Mode
+  // Active Stream Runner Mode
   addLog(
     job,
     'warn',
     `[RE-Mux Note] Running active web runner stream pipeline for task ${jobId}...`
   );
+  reportProgress();
 
   let stepCounter = 0;
   const totalSegs = Math.floor(Math.random() * 500) + 300;
@@ -602,6 +673,7 @@ function runDownloadProcess(
     if (job.status === 'parsing') {
       job.status = 'downloading_video';
       addLog(job, 'info', `[RE-Mux Engine] Downloading segments [0/${job.totalSegments}]...`);
+      reportProgress();
       return;
     }
 
@@ -642,6 +714,7 @@ function runDownloadProcess(
           `[FFmpeg] Muxing video, multi-channel audio tracks, and subtitles into /downloads/${outputFilename}`
         );
       }
+      reportProgress();
       return;
     }
 
@@ -677,19 +750,45 @@ function runDownloadProcess(
         );
         if (item.intervalTimer) clearInterval(item.intervalTimer);
       }
+      reportProgress();
     }
   }, 1000);
 }
 
+// Tokenizer supporting quoted strings
 function parseArgsFromCommandString(cmdStr: string, binaryName: string): string[] {
   let trimmed = cmdStr.trim();
   if (trimmed.startsWith(binaryName)) {
     trimmed = trimmed.substring(binaryName.length).trim();
   }
 
-  const regex = /(?:[^\s"]+|"[^"]*")+/g;
-  const matches = trimmed.match(regex) || [];
-  return matches.map((arg) => arg.replace(/^"|"$/g, ''));
+  const args: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  let quoteChar = '';
+
+  for (let i = 0; i < trimmed.length; i++) {
+    const char = trimmed[i];
+    if ((char === '"' || char === "'") && !inQuotes) {
+      inQuotes = true;
+      quoteChar = char;
+    } else if (char === quoteChar && inQuotes) {
+      inQuotes = false;
+      quoteChar = '';
+    } else if (char === ' ' && !inQuotes) {
+      if (current.length > 0) {
+        args.push(current);
+        current = '';
+      }
+    } else {
+      current += char;
+    }
+  }
+  if (current.length > 0) {
+    args.push(current);
+  }
+
+  return args;
 }
 
 function addLog(job: DownloadJob, level: LogMessage['level'], message: string) {

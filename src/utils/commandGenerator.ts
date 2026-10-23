@@ -20,19 +20,23 @@ export function generateNm3u8dlCommand(
 
   // 3. Video Selection Flag
   if (selections.autoBestVideo || selections.selectedVideoId === 'best') {
-    parts.push(`--select-video res="1080.*":for=best`);
-  } else if (selections.selectedVideoId && selections.selectedVideoId !== 'worst') {
+    parts.push(`-sv best`);
+  } else if (selections.selectedVideoId === 'worst') {
+    parts.push(`-sv worst`);
+  } else if (selections.selectedVideoId) {
     const videoTrack = analysis.videoTracks.find(
       (v) => v.id === selections.selectedVideoId
     );
     if (videoTrack) {
       if (videoTrack.height > 0) {
-        parts.push(`--select-video res="${videoTrack.height}.*":for=best`);
+        parts.push(`--select-video "res=${videoTrack.height}*"`);
+      } else if (videoTrack.resolution) {
+        parts.push(`--select-video "res=${videoTrack.resolution}"`);
       } else {
-        parts.push(`--select-video id="${videoTrack.id}"`);
+        parts.push(`--select-video "id=${videoTrack.id}"`);
       }
     } else {
-      parts.push(`--select-video id="${selections.selectedVideoId}"`);
+      parts.push(`--select-video "id=${selections.selectedVideoId}"`);
     }
   } else {
     parts.push(`-sv best`);
@@ -40,7 +44,7 @@ export function generateNm3u8dlCommand(
 
   // 4. Multi-Audio Selection Flags
   if (selections.autoAllAudio) {
-    parts.push(`--select-audio all`);
+    parts.push(`-sa all`);
   } else if (selections.selectedAudioIds.length > 0) {
     const selectedAudios = analysis.audioTracks.filter((a) =>
       selections.selectedAudioIds.includes(a.id)
@@ -51,20 +55,20 @@ export function generateNm3u8dlCommand(
       );
       if (langs.length > 0) {
         const langPattern = langs.join('|');
-        parts.push(`--select-audio lang="${langPattern}":for=all`);
+        parts.push(`--select-audio "lang=${langPattern}"`);
       } else {
-        parts.push(`--select-audio all`);
+        parts.push(`-sa all`);
       }
     } else {
       parts.push(`-sa all`);
     }
   } else {
-    parts.push(`--select-audio for=default`);
+    parts.push(`-sa all`);
   }
 
   // 5. Multi-Subtitle Selection Flags
   if (selections.autoAllSubtitles) {
-    parts.push(`--select-subtitle all`);
+    parts.push(`-ss all`);
   } else if (selections.selectedSubtitleIds.length > 0) {
     const selectedSubs = analysis.subtitleTracks.filter((s) =>
       selections.selectedSubtitleIds.includes(s.id)
@@ -75,7 +79,7 @@ export function generateNm3u8dlCommand(
       );
       if (langs.length > 0) {
         const langPattern = langs.join('|');
-        parts.push(`--select-subtitle lang="${langPattern}":for=all`);
+        parts.push(`--select-subtitle "lang=${langPattern}"`);
       } else {
         parts.push(``);
       }
@@ -107,7 +111,13 @@ export function generateNm3u8dlCommand(
     parts.push(`--save-dir "${config.outputDir}"`);
   }
   if (config.outputName) {
-    parts.push(`--save-name "${config.outputName}"`);
+    let cleanName = config.outputName;
+    const safeTitle = (analysis.title || 'Stream').replace(/[^a-zA-Z0-9_-]/g, '_');
+    cleanName = cleanName.replace(/\{title\}/gi, safeTitle);
+    cleanName = cleanName.replace(/\{res\}/gi, '1080p');
+    cleanName = cleanName.replace(/\{lang\}/gi, 'multi');
+    cleanName = cleanName.replace(/[{}]/g, ''); // strip any remaining braces
+    parts.push(`--save-name "${cleanName || safeTitle}"`);
   } else if (analysis.title) {
     const safeTitle = analysis.title.replace(/[^a-zA-Z0-9_-]/g, '_');
     parts.push(`--save-name "${safeTitle}"`);
