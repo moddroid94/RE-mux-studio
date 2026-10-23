@@ -1,0 +1,17 @@
+version: "3.8"
+services:
+  remux-studio:
+    build:
+      context: .
+      dockerfile: dockerfile
+    pull_policy: build
+    container_name: remux-studio
+    ports:
+      - 3000:3000
+    volumes:
+      - /srv/data/remux/downloads:/app/downloads
+    restart: unless-stopped
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+networks: {}
