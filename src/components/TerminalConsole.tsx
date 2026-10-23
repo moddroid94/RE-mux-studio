@@ -1,43 +1,59 @@
-import React, { useState } from 'react';
 import {
+  Check,
+  Copy,
+  Download,
+  Filter,
+  Search,
   Terminal as TerminalIcon,
   X,
-  Copy,
-  Check,
-  Download,
-  Trash2,
-  Search,
-  Filter,
 } from 'lucide-react';
-import { DownloadJob, LogMessage } from '../types/stream';
+import React, { useEffect, useRef, useState } from 'react';
+import { DownloadJob } from '../types/stream';
 
 interface TerminalConsoleProps {
   job: DownloadJob | null;
   onClose: () => void;
 }
 
-export const TerminalConsole: React.FC<TerminalConsoleProps> = ({ job, onClose }) => {
+export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
+  job,
+  onClose,
+}) => {
   const [copied, setCopied] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [levelFilter, setLevelFilter] = useState<string>('all');
+  const logContainerRef = useRef<HTMLDivElement | null>(null);
+
+  // Auto-scroll to bottom of terminal output as new log lines arrive
+  useEffect(() => {
+    if (logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  }, [job?.logs.length]);
 
   if (!job) return null;
 
   const filteredLogs = job.logs.filter((log) => {
-    const matchesQuery = log.message.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesQuery = log.message
+      .toLowerCase()
+      .includes(searchQuery.toLowerCase());
     const matchesLevel = levelFilter === 'all' || log.level === levelFilter;
     return matchesQuery && matchesLevel;
   });
 
   const handleCopyLogs = () => {
-    const text = job.logs.map((l) => `[${l.timestamp}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
+    const text = job.logs
+      .map((l) => `[${l.timestamp}] [${l.level.toUpperCase()}] ${l.message}`)
+      .join('\n');
     navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const handleDownloadLogFile = () => {
-    const text = job.logs.map((l) => `[${l.timestamp}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
+    const text = job.logs
+      .map((l) => `[${l.timestamp}] [${l.level.toUpperCase()}] ${l.message}`)
+      .join('\n');
     const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -59,6 +75,7 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({ job, onClose }
             <span className="text-xs font-mono font-bold text-slate-300 ml-2 flex items-center gap-2">
               <TerminalIcon className="w-4 h-4 text-cyan-400" />
               N_m3u8DL-RE Execution Output Log ({job.id})
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse ml-1" title="Live Terminal Feed Active" />
             </span>
           </div>
 
@@ -68,7 +85,11 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({ job, onClose }
               className="p-2 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg flex items-center gap-1.5 transition-colors"
               title="Copy All Logs"
             >
-              {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+              {copied ? (
+                <Check className="w-3.5 h-3.5 text-emerald-400" />
+              ) : (
+                <Copy className="w-3.5 h-3.5" />
+              )}
               <span>{copied ? 'Copied' : 'Copy'}</span>
             </button>
 
@@ -120,7 +141,10 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({ job, onClose }
         </div>
 
         {/* Main Log Lines Terminal Output */}
-        <div className="flex-1 bg-slate-950 p-6 font-mono text-xs overflow-y-auto space-y-1.5 selection:bg-cyan-500 selection:text-slate-950 leading-relaxed">
+        <div
+          ref={logContainerRef}
+          className="flex-1 bg-slate-950 p-6 font-mono text-xs overflow-y-auto space-y-1.5 selection:bg-cyan-500 selection:text-slate-950 leading-relaxed"
+        >
           {filteredLogs.length === 0 ? (
             <p className="text-slate-600 italic">No log lines matching current filter.</p>
           ) : (
@@ -132,8 +156,13 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({ job, onClose }
               else if (log.level === 'info') colorClass = 'text-cyan-300';
 
               return (
-                <div key={log.id} className="flex items-start gap-3 hover:bg-slate-900/50 p-0.5 rounded">
-                  <span className="text-slate-600 shrink-0 select-none">[{log.timestamp}]</span>
+                <div
+                  key={log.id}
+                  className="flex items-start gap-3 hover:bg-slate-900/50 p-0.5 rounded"
+                >
+                  <span className="text-slate-600 shrink-0 select-none">
+                    [{log.timestamp}]
+                  </span>
                   <span
                     className={`uppercase font-bold shrink-0 text-[10px] px-1 rounded ${
                       log.level === 'error'

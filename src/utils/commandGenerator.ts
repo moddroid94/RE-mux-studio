@@ -1,10 +1,7 @@
 import {
-  AudioTrack,
   CommandConfig,
   ManifestAnalysis,
-  StreamSelections,
-  SubtitleTrack,
-  VideoTrack,
+  StreamSelections
 } from '../types/stream';
 
 export function generateNm3u8dlCommand(
@@ -89,7 +86,7 @@ export function generateNm3u8dlCommand(
 
   // 6. Muxing Configuration
   if (config.muxer !== 'none') {
-    const format = config.containerFormat || 'mp4';
+    const format = config.containerFormat || 'mkv';
     const muxerName = config.muxer || 'ffmpeg';
     parts.push(`-M format=${format}`);
   }
@@ -175,7 +172,7 @@ export function generateFFmpegStandaloneCommand(
   audioFiles: string[],
   subtitleFiles: string[],
   outputFile: string,
-  container: string = 'mp4'
+  container: string = 'mkv'
 ): string {
   const inputs: string[] = [];
   const mappings: string[] = [];

@@ -56,30 +56,58 @@ export default function App() {
     customFfmpegFlags: '',
   });
 
-  // Active Jobs and Terminal Logs
+  // Active Jobs and Active Log Modal Job ID
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
-  const [activeLogsJob, setActiveLogsJob] = useState<DownloadJob | null>(null);
+  const [activeLogsJobId, setActiveLogsJobId] = useState<string | null>(null);
 
-  // Poll / Sync Jobs progress
+  // Derive active modal job from jobs array
+  const activeLogsJob = jobs.find((j) => j.id === activeLogsJobId) || null;
+
+  // Stable Single EventSource SSE Stream for all active jobs
   useEffect(() => {
-    const fetchJobs = async () => {
-      try {
-        const res = await fetch('/api/download/jobs');
-        if (res.ok) {
-          const data = await res.json();
+    let eventSource: EventSource | null = null;
+    let fallbackPoll: NodeJS.Timeout | null = null;
+
+    const connectSSE = () => {
+      eventSource = new EventSource('/api/download/events');
+
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
           if (data.jobs) {
             setJobs(data.jobs);
           }
+        } catch (err) {
+          console.error('[SSE Error] Data parse failed:', err);
         }
-      } catch (e) {
-        // Ignore background polling errors
-      }
+      };
+
+      eventSource.onerror = () => {
+        console.warn('[SSE Connection] Connection lost or reconnecting...');
+        eventSource?.close();
+      };
     };
 
-    fetchJobs();
-    const interval = setInterval(fetchJobs, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    connectSSE();
+
+    // Fallback polling backup if SSE connection drops
+    fallbackPoll = setInterval(async () => {
+      if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+        try {
+          const res = await fetch('/api/download/jobs');
+          if (res.ok) {
+            const data = await res.json();
+            if (data.jobs) setJobs(data.jobs);
+          }
+        } catch (e) {}
+      }
+    }, 2000);
+
+    return () => {
+      if (eventSource) eventSource.close();
+      if (fallbackPoll) clearInterval(fallbackPoll);
+    };
+  }, []); // Empty dependency array -> Created ONCE on mount
 
   // Launch Download Runner Task
   const handleStartDownload = async () => {
@@ -224,7 +252,7 @@ export default function App() {
           <DownloadManager
             jobs={jobs}
             onControlJob={handleControlJob}
-            onOpenLogs={(job) => setActiveLogsJob(job)}
+            onOpenLogs={(job) => setActiveLogsJobId(job.id)}
             onNewStreamClick={() => setActiveTab('analyzer')}
           />
         )}
@@ -242,7 +270,7 @@ export default function App() {
       {/* Terminal Output Modal Console */}
       <TerminalConsole
         job={activeLogsJob}
-        onClose={() => setActiveLogsJob(null)}
+        onClose={() => setActiveLogsJobId(null)}
       />
 
       {/* Clean Footer */}
@@ -250,7 +278,7 @@ export default function App() {
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
           <span>RE-Mux Studio · Stream Downloader & Muxer GUI for N_m3u8DL-RE and FFmpeg</span>
           <div className="flex items-center gap-4 text-slate-400">
-            <span>Docker Ready</span>
+            <span>Real-time SSE Active</span>
             <span>·</span>
             <span>Multi-Audio Remux</span>
             <span>·</span>

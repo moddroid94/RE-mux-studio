@@ -1,10 +1,8 @@
+import { execSync, spawn } from 'child_process';
 import express, { Request, Response } from 'express';
-import { createServer as createViteServer } from 'vite';
-import path from 'path';
 import fs from 'fs';
-import { spawn, execSync, exec } from 'child_process';
-import readline from 'readline';
-import { parseStreamManifest } from './src/utils/manifestParser.js';
+import path from 'path';
+import { createServer as createViteServer } from 'vite';
 import {
   AudioTrack,
   DownloadJob,
@@ -13,6 +11,7 @@ import {
   SubtitleTrack,
   VideoTrack,
 } from './src/types/stream.js';
+import { parseStreamManifest } from './src/utils/manifestParser.js';
 
 interface ActiveJobInternal {
   job: DownloadJob;
@@ -102,7 +101,6 @@ async function startServer() {
       if (fetchSuccess && manifestText) {
         analysis = parseStreamManifest(manifestText, finalUrl, customTitle);
       } else {
-        // Direct stream fallback
         analysis = parseStreamManifest(
           `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.64002a"\nstream.m3u8`,
           finalUrl,
@@ -114,7 +112,6 @@ async function startServer() {
       if (HAS_NM3U8DL) {
         const cliTracks = await probeViaNm3u8dlCLI(finalUrl, headers);
         if (cliTracks) {
-          // Merge any CLI-discovered video, audio, or subtitle tracks
           if (cliTracks.videoTracks.length > 0) {
             analysis.videoTracks = mergeTracks(analysis.videoTracks, cliTracks.videoTracks);
           }
@@ -198,7 +195,27 @@ async function startServer() {
     return res.json({ success: true, jobs });
   });
 
-  // API Route: SSE Stream for real-time progress & logs
+  // API Route: Global SSE Stream for ALL Jobs updates
+  app.get('/api/download/events', (req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const sendAllJobs = () => {
+      const jobs = Array.from(activeJobsStore.values()).map((ij) => ij.job);
+      res.write(`data: ${JSON.stringify({ jobs })}\n\n`);
+    };
+
+    sendAllJobs();
+    const interval = setInterval(sendAllJobs, 1000);
+
+    req.on('close', () => {
+      clearInterval(interval);
+    });
+  });
+
+  // API Route: SSE Stream for a specific job's real-time progress & logs
   app.get('/api/download/stream/:jobId', (req: Request, res: Response) => {
     const { jobId } = req.params;
     const item = activeJobsStore.get(jobId);
@@ -208,11 +225,12 @@ async function startServer() {
     }
 
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
 
     const sendUpdate = () => {
-      res.write(`data: ${JSON.stringify(item.job)}\n\n`);
+      res.write(`data: ${JSON.stringify({ job: item.job })}\n\n`);
     };
 
     sendUpdate();
@@ -349,7 +367,6 @@ function probeViaNm3u8dlCLI(
       });
     }
 
-    // Run dry-run CLI probe
     const args = [url, '--no-log', ...headerFlags];
     const proc = spawn(binary, args, { timeout: 5000 });
 
@@ -364,7 +381,6 @@ function probeViaNm3u8dlCLI(
 
       const lines = stdout.split(/\r?\n/);
       for (const line of lines) {
-        // Parse Video lines e.g. "Id: 01, Bandwidth: 5000000, Resolution: 1920x1080"
         if (line.includes('Resolution:') || line.includes('Video')) {
           const resM = line.match(/Resolution:\s*(\d+x\d+)/i) || line.match(/(\d+x\d+)/);
           const bwM = line.match(/Bandwidth:\s*(\d+)/i) || line.match(/(\d+)\s*bps/i);
@@ -451,37 +467,64 @@ function runDownloadProcess(
   const binaryToUse = HAS_NM3U8DL ? (checkSystemBinary('N_m3u8DL-RE') ? 'N_m3u8DL-RE' : 'm3u8dl-re') : null;
 
   if (binaryToUse) {
-    addLog(job, 'info', `[RE-Mux Execution] Spawning real binary: ${binaryToUse}`);
+    addLog(job, 'info', `[RE-Mux Execution] Spawning binary: ${binaryToUse}`);
 
     const rawArgs = parseArgsFromCommandString(commandExecuted, binaryToUse);
+
+    // Ensure non-interactive execution flags
+    
+    if (!rawArgs.includes('--ui-language')) {
+      rawArgs.push('--ui-language', 'en-US');
+    }
 
     try {
       const child = spawn(binaryToUse, rawArgs, { cwd: DOWNLOADS_DIR });
       item.process = child;
 
+      // Close stdin immediately so N_m3u8DL-RE never hangs waiting for keypress prompts
+      child.stdin?.end();
+
       job.status = 'downloading_video';
 
-      const rlStdout = readline.createInterface({ input: child.stdout });
-      const rlStderr = readline.createInterface({ input: child.stderr });
+      // Custom Chunk Stream Handler splitting on both \r and \n (Carriage Return Carriage Control)
+      let stdoutBuffer = '';
+      let stderrBuffer = '';
 
       const handleLine = (line: string) => {
         const cleanLine = line.trim();
         if (!cleanLine) return;
 
-        addLog(job, cleanLine.includes('mux') ? 'muxer' : 'info', cleanLine);
+        addLog(job, cleanLine.toLowerCase().includes('mux') ? 'muxer' : 'info', cleanLine);
 
+        // Detect stages
+        if (cleanLine.includes('Downloading video') || cleanLine.includes('Segment')) {
+          job.status = 'downloading_video';
+        } else if (cleanLine.includes('Downloading audio')) {
+          job.status = 'downloading_audio';
+        } else if (cleanLine.includes('Downloading subtitle')) {
+          job.status = 'downloading_subtitles';
+        } else if (cleanLine.includes('Muxing') || cleanLine.includes('FFmpeg')) {
+          job.status = 'muxing';
+        }
+
+        // Match Percentage: "45.2%" or "45%"
         const percentMatch = cleanLine.match(/([\d.]+)%/);
         if (percentMatch) {
           const pct = parseFloat(percentMatch[1]);
-          job.progress = Math.min(98, Math.round(pct));
+          job.progress = Math.min(99, Math.round(pct));
         }
 
-        const segMatch = cleanLine.match(/(\d+)\/(\d+)/);
+        // Match Segments: "452/1000" or "452 / 1000"
+        const segMatch = cleanLine.match(/(\d+)\s*\/\s*(\d+)/);
         if (segMatch) {
           job.currentSegment = parseInt(segMatch[1], 10);
           job.totalSegments = parseInt(segMatch[2], 10);
+          if (job.totalSegments > 0) {
+            job.progress = Math.min(98, Math.round((job.currentSegment / job.totalSegments) * 100));
+          }
         }
 
+        // Match Speed: "24.5 MB/s" or "1200 KB/s" or "18.2MiB/s"
         const speedMatch = cleanLine.match(/([\d.]+)\s*(MB\/s|MiB\/s|KB\/s|KiB\/s)/i);
         if (speedMatch) {
           const val = parseFloat(speedMatch[1]);
@@ -494,10 +537,27 @@ function runDownloadProcess(
         }
       };
 
-      rlStdout.on('line', handleLine);
-      rlStderr.on('line', handleLine);
+      // Process stdout chunks splitting on \r\n, \r, and \n
+      child.stdout?.on('data', (chunk: Buffer) => {
+        stdoutBuffer += chunk.toString('utf8');
+        const lines = stdoutBuffer.split(/\r\n|\r|\n/);
+        stdoutBuffer = lines.pop() || '';
+        for (const l of lines) handleLine(l);
+      });
+
+      // Process stderr chunks splitting on \r\n, \r, and \n
+      child.stderr?.on('data', (chunk: Buffer) => {
+        stderrBuffer += chunk.toString('utf8');
+        const lines = stderrBuffer.split(/\r\n|\r|\n/);
+        stderrBuffer = lines.pop() || '';
+        for (const l of lines) handleLine(l);
+      });
 
       child.on('close', (code) => {
+        // Flush remaining buffer
+        if (stdoutBuffer.trim()) handleLine(stdoutBuffer);
+        if (stderrBuffer.trim()) handleLine(stderrBuffer);
+
         if (code === 0) {
           job.status = 'completed';
           job.progress = 100;
