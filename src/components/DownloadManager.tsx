@@ -250,7 +250,7 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
 
                     {job.status === 'completed' && (
                       <a
-                        href={`/downloads/${job.outputFile}`}
+                        href={`/api/download/file/${encodeURIComponent(job.outputFile)}`}
                         download={job.outputFile}
                         target="_blank"
                         rel="noreferrer"

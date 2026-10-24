@@ -63,7 +63,30 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Serve completed downloaded files
+  // Serve completed downloaded files safely without falling through to SPA index.html
+  app.get('/downloads/:filename', (req: Request, res: Response) => {
+    const filename = path.basename(req.params.filename);
+    const filePath = path.join(DOWNLOADS_DIR, filename);
+
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      return res.download(filePath, filename);
+    }
+
+    try {
+      const items = fs.readdirSync(DOWNLOADS_DIR);
+      for (const item of items) {
+        const subDir = path.join(DOWNLOADS_DIR, item);
+        if (fs.statSync(subDir).isDirectory()) {
+          const nestedPath = path.join(subDir, filename);
+          if (fs.existsSync(nestedPath) && fs.statSync(nestedPath).isFile()) {
+            return res.download(nestedPath, filename);
+          }
+        }
+      }
+    } catch {}
+
+    return res.status(404).send('File not found in downloads directory.');
+  });
   app.use('/downloads', express.static(DOWNLOADS_DIR));
 
   // System Status Endpoint
@@ -210,6 +233,157 @@ async function startServer() {
     }
   });
 
+  // API Route: Automated Task Probe & Start Download Endpoint
+  app.post('/api/tasks', async (req: Request, res: Response) => {
+    try {
+      const url = req.body.url || req.body.stream_url || req.body.url_stream;
+      const outputName =
+        req.body.output_name ||
+        req.body.outputName ||
+        req.body.title ||
+        req.body.customTitle ||
+        'Stream Download';
+      const rawHeaders = req.body.headers || req.body.custom_headers || req.body.customHeaders;
+
+      if (!url || typeof url !== 'string' || !url.trim()) {
+        return res.status(400).json({ error: 'Valid stream URL is required in "url" field' });
+      }
+
+      const targetUrl = url.trim();
+      const { headerObj, headerFlags } = parseHeadersInput(rawHeaders);
+
+      // Probe stream in background / fast CLI probe if binary available
+      let discoveredLangs: { audio: string[]; sub: string[] } = { audio: [], sub: [] };
+      if (HAS_NM3U8DL) {
+        try {
+          const cliTracks = await probeViaNm3u8dlCLI(targetUrl, headerObj);
+          if (cliTracks) {
+            discoveredLangs.audio = Array.from(
+              new Set(cliTracks.audioTracks.map((a) => a.language).filter(Boolean))
+            );
+            discoveredLangs.sub = Array.from(
+              new Set(cliTracks.subtitleTracks.map((s) => s.language).filter(Boolean))
+            );
+          }
+        } catch (probeErr) {
+          console.warn('[Tasks API Probe Warning]', probeErr);
+        }
+      }
+
+      // Check discovered subtitle languages: IF both eng and ita are present download both, otherwise none
+      const subLangs = discoveredLangs.sub.map((s) => s.toLowerCase());
+      const hasEngSub = subLangs.some((s) => s.includes('eng') || s === 'en');
+      const hasItaSub = subLangs.some((s) => s.includes('ita') || s === 'it');
+      let subFlag = ''
+      if (hasEngSub ) {
+        if (hasItaSub) {
+          subFlag = '--select-subtitle "lang=eng|ita"'
+        } else {
+          subFlag = '--select-subtitle "lang=eng"'
+        }
+      } else {
+        if (hasItaSub) {
+          subFlag = '--select-subtitle "lang=ita"'
+        } else {
+          subFlag = ''
+        }
+      }
+      const subSummary = (hasEngSub && hasItaSub) ? ['eng', 'ita'] : ['None'];
+
+      // Format safe output filename and save name
+      const cleanBase = outputName.replace(/[/\\?%*:|"<>']/g, '_').trim() || 'Stream';
+      const safeSaveName = cleanBase.replace(/[\s]+/g, '_').replace(/_+/g, '_');
+
+      const cmdParts = [
+        'N_m3u8DL-RE',
+        `"${targetUrl}"`,
+        '-sv best',
+        '-sa all',
+        '-M format=mp4',
+        '--thread-count 8',
+        '--download-retry-count 3',
+        '--save-dir "./downloads"',
+        `--save-name "${safeSaveName}"`,
+      ];
+
+      if (subFlag) {
+        cmdParts.push(subFlag);
+      }
+
+      if (headerFlags.length > 0) {
+        for (let i = 0; i < headerFlags.length; i += 2) {
+          cmdParts.push(`${headerFlags[i]} "${headerFlags[i + 1]}"`);
+        }
+      }
+
+      const commandExecuted = cmdParts.join(' ');
+      const jobId = 'job_' + Date.now();
+      const outputFilename = `${safeSaveName}.mp4`;
+
+      const newJob: DownloadJob = {
+        id: jobId,
+        url: targetUrl,
+        title: outputName,
+        status: 'parsing',
+        progress: 0,
+        currentSegment: 0,
+        totalSegments: 100,
+        currentSpeedBps: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        elapsedSeconds: 0,
+        etaSeconds: 0,
+        speedHistory: [0],
+        commandExecuted,
+        selectionsSummary: {
+          video: 'Best Quality',
+          audio: discoveredLangs.audio.length > 0 ? discoveredLangs.audio : ['All Audio Tracks'],
+          subtitles: subSummary,
+        },
+        logs: [
+          {
+            id: 'log_0',
+            timestamp: new Date().toISOString().substring(11, 19),
+            level: 'info',
+            message: `[API Task Created] Automated task ${jobId} initialized for "${outputName}"`,
+          },
+          {
+            id: 'log_1',
+            timestamp: new Date().toISOString().substring(11, 19),
+            level: 'info',
+            message: `Executing CLI Command: ${commandExecuted}`,
+          },
+        ],
+        outputFile: outputFilename,
+        createdAt: new Date().toISOString(),
+      };
+
+      const internalJob: ActiveJobInternal = { job: newJob };
+      activeJobsStore.set(jobId, internalJob);
+
+      // Launch process with callback lambda for instant progress reporting
+      runDownloadProcess(
+        jobId,
+        targetUrl,
+        commandExecuted,
+        { containerFormat: 'mp4' },
+        outputFilename,
+        (updatedJob) => {
+          notifyJobProgress(updatedJob);
+        }
+      );
+
+      return res.json({
+        success: true,
+        jobId,
+        job: newJob,
+        commandExecuted,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Failed to process task request' });
+    }
+  });
+
   // API Route: Get all jobs
   app.get('/api/download/jobs', (_req: Request, res: Response) => {
     const jobs = Array.from(activeJobsStore.values()).map((ij) => ij.job);
@@ -279,14 +453,27 @@ async function startServer() {
 
   // API Route: Download File
   app.get('/api/download/file/:filename', (req: Request, res: Response) => {
-    const filename = req.params.filename;
+    const filename = path.basename(req.params.filename);
     const filePath = path.join(DOWNLOADS_DIR, filename);
 
-    if (fs.existsSync(filePath)) {
-      return res.download(filePath);
-    } else {
-      return res.status(404).send('File not found in downloads directory.');
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      return res.download(filePath, filename);
     }
+
+    try {
+      const items = fs.readdirSync(DOWNLOADS_DIR);
+      for (const item of items) {
+        const subDir = path.join(DOWNLOADS_DIR, item);
+        if (fs.statSync(subDir).isDirectory()) {
+          const nestedPath = path.join(subDir, filename);
+          if (fs.existsSync(nestedPath) && fs.statSync(nestedPath).isFile()) {
+            return res.download(nestedPath, filename);
+          }
+        }
+      }
+    } catch {}
+
+    return res.status(404).send('File not found in downloads directory.');
   });
 
   // API Route: Control Job
@@ -386,6 +573,61 @@ async function startServer() {
   app.listen(PORT, () => {
     console.log(`RE-Mux Studio server active on http://localhost:${PORT}`);
   });
+}
+
+// Helper to parse header inputs from string, object, or array
+function parseHeadersInput(headersInput: any): {
+  headerObj: Record<string, string>;
+  headerFlags: string[];
+} {
+  const headerObj: Record<string, string> = {};
+  const headerFlags: string[] = [];
+
+  if (!headersInput) return { headerObj, headerFlags };
+
+  const processLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const colonIndex = trimmed.indexOf(':');
+    if (colonIndex > 0) {
+      const key = trimmed.substring(0, colonIndex).trim();
+      const value = trimmed.substring(colonIndex + 1).trim();
+      if (key && value) {
+        headerObj[key] = value;
+        headerFlags.push('-H', `${key}: ${value}`);
+      }
+    }
+  };
+
+  if (typeof headersInput === 'string') {
+    headersInput.split(/\r?\n/).forEach(processLine);
+  } else if (Array.isArray(headersInput)) {
+    headersInput.forEach((item) => {
+      if (typeof item === 'string') {
+        processLine(item);
+      } else if (item && typeof item === 'object') {
+        const key = item.key || item.name || item.header;
+        const val = item.value || item.val;
+        if (key && val) {
+          const kStr = String(key).trim();
+          const vStr = String(val).trim();
+          headerObj[kStr] = vStr;
+          headerFlags.push('-H', `${kStr}: ${vStr}`);
+        }
+      }
+    });
+  } else if (typeof headersInput === 'object' && headersInput !== null) {
+    for (const [key, value] of Object.entries(headersInput)) {
+      if (key && value) {
+        const kStr = String(key).trim();
+        const vStr = String(value).trim();
+        headerObj[kStr] = vStr;
+        headerFlags.push('-H', `${kStr}: ${vStr}`);
+      }
+    }
+  }
+
+  return { headerObj, headerFlags };
 }
 
 // Native CLI Probe Helper using N_m3u8DL-RE CLI
@@ -491,6 +733,71 @@ function mergeTracks<T extends { id: string }>(existing: T[], cliDiscovered: T[]
   return merged;
 }
 
+function locateAndRelocateOutputFile(targetFilename: string): { filename: string; bytes: number } {
+  const directPath = path.join(DOWNLOADS_DIR, targetFilename);
+  if (fs.existsSync(directPath) && fs.statSync(directPath).isFile()) {
+    return { filename: targetFilename, bytes: fs.statSync(directPath).size };
+  }
+
+  const scanDir = (dir: string): string[] => {
+    let results: string[] = [];
+    try {
+      const list = fs.readdirSync(dir);
+      for (const item of list) {
+        const full = path.join(dir, item);
+        const stat = fs.statSync(full);
+        if (stat.isDirectory()) {
+          results = results.concat(scanDir(full));
+        } else if (stat.isFile()) {
+          results.push(full);
+        }
+      }
+    } catch {}
+    return results;
+  };
+
+  const allFiles = scanDir(DOWNLOADS_DIR);
+  if (allFiles.length === 0) {
+    return { filename: targetFilename, bytes: 0 };
+  }
+
+  const targetBase = targetFilename.split('.')[0].toLowerCase();
+  let matchedPath = allFiles.find((f) => {
+    const name = path.basename(f).toLowerCase();
+    return name.includes(targetBase) || targetBase.includes(name.split('.')[0]);
+  });
+
+  if (!matchedPath) {
+    const mediaExts = ['.mp4', '.mkv', '.ts', '.m4a', '.webm', '.mov', '.mp3', '.aac'];
+    const mediaFiles = allFiles.filter((f) => mediaExts.some((ext) => f.toLowerCase().endsWith(ext)));
+    if (mediaFiles.length > 0) {
+      mediaFiles.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+      matchedPath = mediaFiles[0];
+    }
+  }
+
+  if (matchedPath) {
+    const foundName = path.basename(matchedPath);
+    const destPath = path.join(DOWNLOADS_DIR, foundName);
+
+    if (matchedPath !== destPath) {
+      try {
+        fs.renameSync(matchedPath, destPath);
+      } catch {
+        try {
+          fs.copyFileSync(matchedPath, destPath);
+          fs.unlinkSync(matchedPath);
+        } catch {}
+      }
+    }
+
+    const size = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
+    return { filename: foundName, bytes: size };
+  }
+
+  return { filename: targetFilename, bytes: 0 };
+}
+
 // Real Process Execution Engine with Callback Lambda Reporting
 function runDownloadProcess(
   jobId: string,
@@ -544,7 +851,7 @@ function runDownloadProcess(
 
     try {
       const child = spawn(spawnCmd, spawnArgs, {
-        cwd: DOWNLOADS_DIR,
+        cwd: path.resolve('.'),
         env: {
           ...process.env,
           TERM: 'xterm-256color',
@@ -790,42 +1097,11 @@ function runDownloadProcess(
         if (stdoutBuffer.trim()) handleLine(stdoutBuffer);
         if (stderrBuffer.trim()) handleLine(stderrBuffer);
 
-        let finalSizeBytes = 0;
-        try {
-          const files = fs.readdirSync(DOWNLOADS_DIR);
-
-          let resolvedFile = job.outputFile;
-          if (fs.existsSync(path.join(DOWNLOADS_DIR, job.outputFile))) {
-            resolvedFile = job.outputFile;
-          } else {
-            const baseName = job.outputFile.split('.')[0].toLowerCase();
-            const matched = files.find((f) => f.toLowerCase().includes(baseName) || baseName.includes(f.split('.')[0].toLowerCase()));
-            if (matched) {
-              resolvedFile = matched;
-            } else {
-              const mediaExts = ['.mp4', '.mkv', '.ts', '.m4a', '.webm', '.mov', '.mp3', '.aac'];
-              const sorted = files
-                .filter((f) => mediaExts.some((ext) => f.toLowerCase().endsWith(ext)))
-                .map((f) => ({ name: f, mtime: fs.statSync(path.join(DOWNLOADS_DIR, f)).mtimeMs }))
-                .sort((a, b) => b.mtime - a.mtime);
-
-              if (sorted.length > 0) {
-                resolvedFile = sorted[0].name;
-              }
-            }
-          }
-
-          if (fs.existsSync(path.join(DOWNLOADS_DIR, resolvedFile))) {
-            job.outputFile = resolvedFile;
-            finalSizeBytes = fs.statSync(path.join(DOWNLOADS_DIR, resolvedFile)).size;
-          }
-        } catch {
-          // ignore
-        }
-
-        if (finalSizeBytes > 0) {
-          job.downloadedBytes = finalSizeBytes;
-          job.totalBytes = finalSizeBytes;
+        const fileResult = locateAndRelocateOutputFile(job.outputFile);
+        if (fileResult.bytes > 0) {
+          job.outputFile = fileResult.filename;
+          job.downloadedBytes = fileResult.bytes;
+          job.totalBytes = fileResult.bytes;
         }
 
         if (code === 0) {
