@@ -310,7 +310,7 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
                     <div>
                       <span className="text-slate-500 block text-[10px]">SIZE DOWNLOADED</span>
                       <strong className="text-white">
-                        {formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}
+                        {formatBytes(job.downloadedBytes)}
                       </strong>
                     </div>
                   </div>
