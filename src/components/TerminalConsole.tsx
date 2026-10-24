@@ -1,4 +1,5 @@
 import {
+  ArrowDown,
   Check,
   Copy,
   Download,
@@ -22,14 +23,35 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
   const [copied, setCopied] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [levelFilter, setLevelFilter] = useState<string>('all');
+  const [userScrolledUp, setUserScrolledUp] = useState(false);
   const logContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const lastLogId = job?.logs[job.logs.length - 1]?.id;
 
   // Auto-scroll to bottom of terminal output as new log lines arrive
   useEffect(() => {
+    if (logContainerRef.current && !userScrolledUp) {
+      const el = logContainerRef.current;
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+      });
+    }
+  }, [job?.logs, lastLogId, searchQuery, levelFilter, userScrolledUp]);
+
+  const handleScroll = () => {
+    if (logContainerRef.current) {
+      const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
+      const isBottom = scrollHeight - scrollTop - clientHeight < 30;
+      setUserScrolledUp(!isBottom);
+    }
+  };
+
+  const scrollToBottom = () => {
     if (logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+      setUserScrolledUp(false);
     }
-  }, [job?.logs.length]);
+  };
 
   if (!job) return null;
 
@@ -141,45 +163,58 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
         </div>
 
         {/* Main Log Lines Terminal Output */}
-        <div
-          ref={logContainerRef}
-          className="flex-1 bg-slate-950 p-6 font-mono text-xs overflow-y-auto space-y-1.5 selection:bg-cyan-500 selection:text-slate-950 leading-relaxed"
-        >
-          {filteredLogs.length === 0 ? (
-            <p className="text-slate-600 italic">No log lines matching current filter.</p>
-          ) : (
-            filteredLogs.map((log) => {
-              let colorClass = 'text-slate-300';
-              if (log.level === 'error') colorClass = 'text-red-400 font-bold';
-              else if (log.level === 'warn') colorClass = 'text-amber-300';
-              else if (log.level === 'muxer') colorClass = 'text-purple-400 font-semibold';
-              else if (log.level === 'info') colorClass = 'text-cyan-300';
+        <div className="relative flex-1 min-h-0">
+          <div
+            ref={logContainerRef}
+            onScroll={handleScroll}
+            className="h-full bg-slate-950 p-6 font-mono text-xs overflow-y-auto space-y-1.5 selection:bg-cyan-500 selection:text-slate-950 leading-relaxed"
+          >
+            {filteredLogs.length === 0 ? (
+              <p className="text-slate-600 italic">No log lines matching current filter.</p>
+            ) : (
+              filteredLogs.map((log) => {
+                let colorClass = 'text-slate-300';
+                if (log.level === 'error') colorClass = 'text-red-400 font-bold';
+                else if (log.level === 'warn') colorClass = 'text-amber-300';
+                else if (log.level === 'muxer') colorClass = 'text-purple-400 font-semibold';
+                else if (log.level === 'info') colorClass = 'text-cyan-300';
 
-              return (
-                <div
-                  key={log.id}
-                  className="flex items-start gap-3 hover:bg-slate-900/50 p-0.5 rounded"
-                >
-                  <span className="text-slate-600 shrink-0 select-none">
-                    [{log.timestamp}]
-                  </span>
-                  <span
-                    className={`uppercase font-bold shrink-0 text-[10px] px-1 rounded ${
-                      log.level === 'error'
-                        ? 'bg-red-500/20 text-red-400'
-                        : log.level === 'warn'
-                        ? 'bg-amber-500/20 text-amber-300'
-                        : log.level === 'muxer'
-                        ? 'bg-purple-500/20 text-purple-300'
-                        : 'bg-cyan-500/20 text-cyan-300'
-                    }`}
+                return (
+                  <div
+                    key={log.id}
+                    className="flex items-start gap-3 hover:bg-slate-900/50 p-0.5 rounded"
                   >
-                    {log.level}
-                  </span>
-                  <span className={`${colorClass} break-all`}>{log.message}</span>
-                </div>
-              );
-            })
+                    <span className="text-slate-600 shrink-0 select-none">
+                      [{log.timestamp}]
+                    </span>
+                    <span
+                      className={`uppercase font-bold shrink-0 text-[10px] px-1 rounded ${
+                        log.level === 'error'
+                          ? 'bg-red-500/20 text-red-400'
+                          : log.level === 'warn'
+                          ? 'bg-amber-500/20 text-amber-300'
+                          : log.level === 'muxer'
+                          ? 'bg-purple-500/20 text-purple-300'
+                          : 'bg-cyan-500/20 text-cyan-300'
+                      }`}
+                    >
+                      {log.level}
+                    </span>
+                    <span className={`${colorClass} break-all`}>{log.message}</span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {userScrolledUp && (
+            <button
+              onClick={scrollToBottom}
+              className="absolute bottom-4 right-6 px-3 py-1.5 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs rounded-full shadow-lg flex items-center gap-1.5 animate-bounce transition-all"
+            >
+              <ArrowDown className="w-3.5 h-3.5" />
+              <span>Scroll to Bottom</span>
+            </button>
           )}
         </div>
       </div>

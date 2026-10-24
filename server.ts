@@ -48,13 +48,28 @@ const HAS_FFMPEG = checkSystemBinary('ffmpeg');
 console.log(`[RE-Mux System Check] N_m3u8DL-RE Binary: ${HAS_NM3U8DL ? 'INSTALLED' : 'NOT FOUND (Docker mode)'}`);
 console.log(`[RE-Mux System Check] FFmpeg Binary: ${HAS_FFMPEG ? 'INSTALLED' : 'NOT FOUND (Docker mode)'}`);
 
-// Notify all registered progress lambdas
-function notifyJobProgress(job: DownloadJob) {
+const lastJobNotificationTimeMap = new Map<string, number>();
+let lastGlobalNotificationTime = 0;
+
+// Notify all registered progress lambdas (throttled to at most once per second per job unless forced)
+function notifyJobProgress(job: DownloadJob, force = false) {
+  const now = Date.now();
+  const lastJobTime = lastJobNotificationTimeMap.get(job.id) || 0;
+
+  if (!force && now - lastJobTime < 1000) {
+    return;
+  }
+  lastJobNotificationTimeMap.set(job.id, now);
+
   const listeners = jobProgressListenerMap.get(job.id);
   if (listeners) {
     listeners.forEach((cb) => cb(job));
   }
-  globalProgressListeners.forEach((cb) => cb());
+
+  if (force || now - lastGlobalNotificationTime >= 1000) {
+    lastGlobalNotificationTime = now;
+    globalProgressListeners.forEach((cb) => cb());
+  }
 }
 
 async function startServer() {
@@ -235,7 +250,7 @@ async function startServer() {
 
   //EXTENSION COMPATIBILITY LAYER
   //fake login ok response
-  app.post('/api/auth/login', (req: Request, res: Request) => {
+  app.post('/api/auth/login', (req: Request, res: Response) => {
     return res.json({
       id: 1,
       username: req.body.username,
@@ -823,8 +838,8 @@ function runDownloadProcess(
   const binaryToUse = HAS_NM3U8DL ? (checkSystemBinary('N_m3u8DL-RE') ? 'N_m3u8DL-RE' : 'm3u8dl-re') : null;
 
   // Callback helper lambda
-  const reportProgress = () => {
-    notifyJobProgress(job);
+  const reportProgress = (force = false) => {
+    notifyJobProgress(job, force);
     if (onProgressUpdate) {
       onProgressUpdate(job);
     }
@@ -913,13 +928,22 @@ function runDownloadProcess(
       const stripAnsi = (str: string) =>
         str.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 
+      let lastProgressLogTime = 0;
+
       const handleLine = (line: string) => {
         const cleanLine = stripAnsi(line).trim();
         if (!cleanLine) return;
 
-        addLog(job, cleanLine.toLowerCase().includes('mux') ? 'muxer' : 'info', cleanLine);
+        const isProgressBarLine = cleanLine.includes('━') || /^(Vid|Aud|Sub)\*?\s/i.test(cleanLine);
+        if (!isProgressBarLine) {
+          addLog(job, cleanLine.toLowerCase().includes('mux') ? 'muxer' : 'info', cleanLine);
+        } else if (Date.now() - lastProgressLogTime > 3000) {
+          lastProgressLogTime = Date.now();
+          addLog(job, 'info', cleanLine);
+        }
 
         // Update stage/status based on N_m3u8DL-RE track markers
+        const oldStatus = job.status;
         if (cleanLine.includes('Downloading video') || cleanLine.startsWith('Vid') || cleanLine.includes('Vid*')) {
           job.status = 'downloading_video';
         } else if (cleanLine.includes('Downloading audio') || cleanLine.startsWith('Aud') || cleanLine.includes('Aud*')) {
@@ -1083,8 +1107,8 @@ function runDownloadProcess(
           job.totalBytes = Math.round(job.downloadedBytes / (job.progress / 100));
         }
 
-        // Invoke callback lambda on every line parsed
-        reportProgress();
+        // Invoke callback lambda (throttled to max 1 update/sec, unless status changed)
+        reportProgress(oldStatus !== job.status);
       };
 
       child.stdout?.on('data', (chunk: Buffer) => {
@@ -1288,7 +1312,7 @@ function addLog(job: DownloadJob, level: LogMessage['level'], message: string) {
     message,
   };
   job.logs.push(log);
-  if (job.logs.length > 250) job.logs.shift();
+  if (job.logs.length > 80) job.logs.shift();
 }
 
 startServer();
