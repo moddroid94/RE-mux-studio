@@ -1,19 +1,18 @@
-import React, { useState } from 'react';
 import {
-  Download,
-  Pause,
-  Play,
-  XCircle,
-  CheckCircle2,
   AlertTriangle,
-  Terminal,
-  FileVideo,
+  CheckCircle2,
   Clock,
+  Download,
+  FileVideo,
   Gauge,
   Layers,
+  Pause,
+  Play,
   Sparkles,
-  RotateCcw,
+  Terminal,
+  XCircle
 } from 'lucide-react';
+import React, { useState } from 'react';
 import { DownloadJob } from '../types/stream';
 
 interface DownloadManagerProps {
@@ -234,10 +233,10 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
 
                     {job.status === 'completed' && (
                       <a
-                        href={`data:text/plain;charset=utf-8,${encodeURIComponent(
-                          `RE-Mux Studio Output File: ${job.outputFile}\nCommand Executed: ${job.commandExecuted}`
-                        )}`}
+                        href={`/downloads/${job.outputFile}`}
                         download={job.outputFile}
+                        target="_blank"
+                        rel="noreferrer"
                         className="px-3.5 py-1.5 text-xs font-bold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-lg shadow-md flex items-center gap-1.5"
                       >
                         <FileVideo className="w-3.5 h-3.5" /> Download Muxed File

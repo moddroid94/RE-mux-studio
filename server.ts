@@ -679,11 +679,31 @@ function runDownloadProcess(
         if (stdoutBuffer.trim()) handleLine(stdoutBuffer);
         if (stderrBuffer.trim()) handleLine(stderrBuffer);
 
+        let finalSizeBytes = 0;
+        try {
+          const files = fs.readdirSync(DOWNLOADS_DIR);
+          const baseName = outputFilename.split('.')[0].toLowerCase();
+          const matched = files.find(f => f.toLowerCase().includes(baseName));
+          if (matched) {
+            finalSizeBytes = fs.statSync(path.join(DOWNLOADS_DIR, matched)).size;
+          } else if (fs.existsSync(path.join(DOWNLOADS_DIR, outputFilename))) {
+            finalSizeBytes = fs.statSync(path.join(DOWNLOADS_DIR, outputFilename)).size;
+          }
+        } catch {
+          // ignore
+        }
+
+        if (finalSizeBytes > 0) {
+          job.downloadedBytes = finalSizeBytes;
+          job.totalBytes = finalSizeBytes;
+        }
+
         if (code === 0) {
           job.status = 'completed';
           job.progress = 100;
           job.etaSeconds = 0;
-          addLog(job, 'info', `[SUCCESS] Download completed! Saved output file: /downloads/${outputFilename}`);
+          const sizeMb = (job.downloadedBytes / (1024 * 1024)).toFixed(1);
+          addLog(job, 'info', `[SUCCESS] Download completed! Output file: /downloads/${outputFilename} (${sizeMb} MB)`);
         } else {
           job.status = 'failed';
           job.error = `Process exited with code ${code}`;

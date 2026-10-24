@@ -110,18 +110,50 @@ export function generateNm3u8dlCommand(
   if (config.outputDir) {
     parts.push(`--save-dir "${config.outputDir}"`);
   }
-  if (config.outputName) {
-    let cleanName = config.outputName;
-    const safeTitle = (analysis.title || 'Stream').replace(/[^a-zA-Z0-9_-]/g, '_');
-    cleanName = cleanName.replace(/\{title\}/gi, safeTitle);
-    cleanName = cleanName.replace(/\{res\}/gi, '1080p');
-    cleanName = cleanName.replace(/\{lang\}/gi, 'multi');
-    cleanName = cleanName.replace(/[{}]/g, ''); // strip any remaining braces
-    parts.push(`--save-name "${cleanName || safeTitle}"`);
-  } else if (analysis.title) {
-    const safeTitle = analysis.title.replace(/[^a-zA-Z0-9_-]/g, '_');
-    parts.push(`--save-name "${safeTitle}"`);
+
+  // Base title sanitized
+  let baseTitle = (config.outputName || analysis.title || 'Stream')
+    .replace(/\{title\}/gi, analysis.title || 'Stream')
+    .replace(/\{res\}/gi, '1080p')
+    .replace(/\{lang\}/gi, 'multi')
+    .replace(/[{}]/g, '')
+    .replace(/[^a-zA-Z0-9_-]/g, '_');
+
+  if (!baseTitle) baseTitle = 'Stream';
+
+  // Extract selected video height/res tag
+  let resTag = '';
+  if (selections.selectedVideoId && selections.selectedVideoId !== 'best' && selections.selectedVideoId !== 'worst') {
+    const vTrack = analysis.videoTracks.find((v) => v.id === selections.selectedVideoId);
+    if (vTrack?.height) {
+      resTag = `_${vTrack.height}p`;
+    } else if (vTrack?.resolution) {
+      resTag = `_${vTrack.resolution}`;
+    }
   }
+
+  // Extract selected audio languages tag
+  const selectedAudios = analysis.audioTracks.filter((a) =>
+    selections.selectedAudioIds.includes(a.id)
+  );
+  let audioLangs = Array.from(new Set(selectedAudios.map((a) => a.language).filter(Boolean)));
+  if (audioLangs.length === 0 && selections.autoAllAudio && analysis.audioTracks.length > 0) {
+    audioLangs = Array.from(new Set(analysis.audioTracks.map((a) => a.language).filter(Boolean)));
+  }
+  const audioTag = audioLangs.length > 0 ? `_audio-${audioLangs.join('-')}` : '';
+
+  // Extract selected subtitle languages tag
+  const selectedSubs = analysis.subtitleTracks.filter((s) =>
+    selections.selectedSubtitleIds.includes(s.id)
+  );
+  let subLangs = Array.from(new Set(selectedSubs.map((s) => s.language).filter(Boolean)));
+  if (subLangs.length === 0 && selections.autoAllSubtitles && analysis.subtitleTracks.length > 0) {
+    subLangs = Array.from(new Set(analysis.subtitleTracks.map((s) => s.language).filter(Boolean)));
+  }
+  const subTag = subLangs.length > 0 ? `_subs-${subLangs.join('-')}` : '';
+
+  const finalSaveName = `${baseTitle}${resTag}${audioTag}${subTag}`.replace(/_+/g, '_');
+  parts.push(`--save-name "${finalSaveName}"`);
 
   // 9. DRM Decryption Keys
   if (config.keys && config.keys.length > 0) {

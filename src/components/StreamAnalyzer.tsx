@@ -1,34 +1,33 @@
-import React, { useState, useEffect } from 'react';
 import {
-  Film,
-  Search,
-  Key,
-  ShieldAlert,
-  CheckCircle2,
-  Volume2,
-  Subtitles,
-  Sparkles,
-  Play,
-  Terminal,
-  Download,
-  Sliders,
-  Plus,
-  Trash2,
-  Globe,
-  Copy,
   Check,
+  CheckCircle2,
+  Copy,
+  Download,
+  Film,
+  Globe,
   History,
   Info,
+  Key,
+  Play,
+  Plus,
+  Search,
+  ShieldAlert,
+  Sliders,
+  Sparkles,
+  Subtitles,
+  Terminal,
+  Trash2,
+  Volume2,
 } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
 import {
   CommandConfig,
   ManifestAnalysis,
   StreamSelections,
 } from '../types/stream';
 import {
-  clearUrlHistory,
   getUrlHistory,
-  saveUrlToHistory,
+  saveUrlToHistory
 } from '../utils/sampleStreams';
 
 interface StreamAnalyzerProps {
@@ -96,6 +95,7 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
         body: JSON.stringify({
           url: urlToProbe,
           headers: headersMap,
+          customTitle: commandConfig.outputName,
         }),
       });
 
@@ -321,65 +321,86 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
           )}
         </div>
 
-        {/* Main Search Input Form */}
-        <div className="flex flex-col sm:flex-row items-stretch gap-3">
-          <div className="relative flex-1">
-            <input
-              type="text"
-              value={streamUrl}
-              onChange={(e) => setStreamUrl(e.target.value)}
-              placeholder="https://example.com/live/master.m3u8 or .mpd URL..."
-              className="w-full pl-10 pr-10 py-3 text-sm bg-slate-950 border border-slate-700 rounded-xl text-white font-mono focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-all placeholder:text-slate-600"
-            />
-            <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-            {streamUrl && (
-              <button
-                onClick={() => {
-                  navigator.clipboard.writeText(streamUrl);
-                  setCopiedUrl(true);
-                  setTimeout(() => setCopiedUrl(false), 2000);
+        {/* Main Search Input Form & Title Row */}
+        <div className="space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div className="md:col-span-1 relative">
+              <input
+                type="text"
+                value={commandConfig.outputName || ''}
+                onChange={(e) => {
+                  const newTitle = e.target.value;
+                  setCommandConfig((prev) => ({ ...prev, outputName: newTitle }));
+                  if (analysis) {
+                    setAnalysis({ ...analysis, title: newTitle || 'Stream' });
+                  }
                 }}
-                className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-white"
-                title="Copy URL"
+                placeholder="Custom File Title (e.g. Movie_Name)..."
+                className="w-full pl-9 pr-3 py-3 text-xs bg-slate-950 border border-slate-700 rounded-xl text-white font-mono focus:outline-none focus:border-cyan-500 transition-all placeholder:text-slate-600"
+              />
+              <Film className="w-4 h-4 text-cyan-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            </div>
+
+            <div className="md:col-span-2 relative flex items-center gap-2">
+              <div className="relative flex-1">
+                <input
+                  type="text"
+                  value={streamUrl}
+                  onChange={(e) => setStreamUrl(e.target.value)}
+                  placeholder="https://example.com/live/master.m3u8 or .mpd URL..."
+                  className="w-full pl-10 pr-10 py-3 text-xs bg-slate-950 border border-slate-700 rounded-xl text-white font-mono focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-all placeholder:text-slate-600"
+                />
+                <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                {streamUrl && (
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(streamUrl);
+                      setCopiedUrl(true);
+                      setTimeout(() => setCopiedUrl(false), 2000);
+                    }}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-white"
+                    title="Copy URL"
+                  >
+                    {copiedUrl ? (
+                      <Check className="w-4 h-4 text-emerald-400" />
+                    ) : (
+                      <Copy className="w-4 h-4" />
+                    )}
+                  </button>
+                )}
+              </div>
+
+              <button
+                onClick={() => handleAnalyze()}
+                disabled={isAnalyzing || !streamUrl.trim()}
+                className="flex items-center justify-center gap-2 px-5 py-3 font-bold text-xs text-slate-950 bg-cyan-400 hover:bg-cyan-300 disabled:opacity-50 disabled:hover:bg-cyan-400 rounded-xl shadow-lg shadow-cyan-500/20 active:scale-95 transition-all whitespace-nowrap"
               >
-                {copiedUrl ? (
-                  <Check className="w-4 h-4 text-emerald-400" />
+                {isAnalyzing ? (
+                  <>
+                    <div className="w-3.5 h-3.5 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
+                    <span>Parsing...</span>
+                  </>
                 ) : (
-                  <Copy className="w-4 h-4" />
+                  <>
+                    <Search className="w-3.5 h-3.5" />
+                    <span>Analyze Stream</span>
+                  </>
                 )}
               </button>
-            )}
+
+              <button
+                onClick={() => setShowAdvancedHeaders(!showAdvancedHeaders)}
+                className={`flex items-center gap-1.5 px-3.5 py-3 text-xs font-semibold rounded-xl border transition-all whitespace-nowrap ${
+                  showAdvancedHeaders
+                    ? 'bg-slate-800 text-cyan-400 border-cyan-500/50'
+                    : 'bg-slate-950 text-slate-300 border-slate-700 hover:text-white'
+                }`}
+              >
+                <Sliders className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Headers & DRM</span>
+              </button>
+            </div>
           </div>
-
-          <button
-            onClick={() => handleAnalyze()}
-            disabled={isAnalyzing || !streamUrl.trim()}
-            className="flex items-center justify-center gap-2 px-6 py-3 font-bold text-sm text-slate-950 bg-cyan-400 hover:bg-cyan-300 disabled:opacity-50 disabled:hover:bg-cyan-400 rounded-xl shadow-lg shadow-cyan-500/20 active:scale-95 transition-all whitespace-nowrap"
-          >
-            {isAnalyzing ? (
-              <>
-                <div className="w-4 h-4 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-                <span>Parsing Manifest...</span>
-              </>
-            ) : (
-              <>
-                <Search className="w-4 h-4" />
-                <span>Analyze Stream</span>
-              </>
-            )}
-          </button>
-
-          <button
-            onClick={() => setShowAdvancedHeaders(!showAdvancedHeaders)}
-            className={`flex items-center gap-2 px-4 py-3 text-xs font-semibold rounded-xl border transition-all ${
-              showAdvancedHeaders
-                ? 'bg-slate-800 text-cyan-400 border-cyan-500/50'
-                : 'bg-slate-950 text-slate-300 border-slate-700 hover:text-white'
-            }`}
-          >
-            <Sliders className="w-4 h-4 text-cyan-400" />
-            <span>Headers & DRM</span>
-          </button>
         </div>
 
         {/* Advanced Headers & DRM Drawer */}
