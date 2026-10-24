@@ -528,10 +528,10 @@ function runDownloadProcess(
 
     if (hasScript) {
       const esc = (arg: string) => {
-        if (/[\s"'$`\\]/.test(arg)) {
-          return `'${arg.replace(/'/g, "'\\''")}'`;
+        if (/^[a-zA-Z0-9_.\-\/=]+$/.test(arg)) {
+          return arg;
         }
-        return arg;
+        return `'${arg.replace(/'/g, "'\\''")}'`;
       };
       const fullCmdString = `${binaryToUse} ${rawArgs.map(esc).join(' ')}`;
       spawnCmd = 'script';
@@ -558,49 +558,102 @@ function runDownloadProcess(
       let stdoutBuffer = '';
       let stderrBuffer = '';
 
+      const trackMap = new Map<string, { current: number; total: number; speedBps: number }>();
+      const startTimestamp = Date.now();
+
+      const timer = setInterval(() => {
+        if (job.status === 'completed' || job.status === 'failed') {
+          clearInterval(timer);
+          return;
+        }
+        job.elapsedSeconds = Math.max(1, Math.floor((Date.now() - startTimestamp) / 1000));
+        reportProgress();
+      }, 1000);
+
+      const stripAnsi = (str: string) =>
+        str.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+
       const handleLine = (line: string) => {
-        const cleanLine = line.trim();
+        const cleanLine = stripAnsi(line).trim();
         if (!cleanLine) return;
 
         addLog(job, cleanLine.toLowerCase().includes('mux') ? 'muxer' : 'info', cleanLine);
 
-        if (cleanLine.includes('Downloading video') || cleanLine.includes('Segment')) {
+        // Update stage/status based on N_m3u8DL-RE track markers
+        if (cleanLine.includes('Downloading video') || cleanLine.startsWith('Vid') || cleanLine.includes('Vid*')) {
           job.status = 'downloading_video';
-        } else if (cleanLine.includes('Downloading audio')) {
+        } else if (cleanLine.includes('Downloading audio') || cleanLine.startsWith('Aud') || cleanLine.includes('Aud*')) {
           job.status = 'downloading_audio';
-        } else if (cleanLine.includes('Downloading subtitle')) {
+        } else if (cleanLine.includes('Downloading subtitle') || cleanLine.startsWith('Sub') || cleanLine.includes('Sub*')) {
           job.status = 'downloading_subtitles';
-        } else if (cleanLine.includes('Muxing') || cleanLine.includes('FFmpeg')) {
+        } else if (cleanLine.includes('Muxing') || cleanLine.includes('FFmpeg') || cleanLine.includes('MuxAfterDone') || cleanLine.includes('Merging')) {
           job.status = 'muxing';
         }
 
-        // Percentage
-        const percentMatch = cleanLine.match(/([\d.]+)%/);
-        if (percentMatch) {
-          const pct = parseFloat(percentMatch[1]);
-          job.progress = Math.min(99, Math.round(pct));
-        }
-
-        // Segment counts
+        const trackMatch = cleanLine.match(/^(Vid|Aud|Sub)\*?\s*([^|]+)/i) || cleanLine.match(/(Vid|Aud|Sub)\*?\s*([\w\-]+)/i);
         const segMatch = cleanLine.match(/(\d+)\s*\/\s*(\d+)/);
-        if (segMatch) {
-          job.currentSegment = parseInt(segMatch[1], 10);
-          job.totalSegments = parseInt(segMatch[2], 10);
-          if (job.totalSegments > 0) {
-            job.progress = Math.min(98, Math.round((job.currentSegment / job.totalSegments) * 100));
-          }
-        }
-
-        // Speed
         const speedMatch = cleanLine.match(/([\d.]+)\s*(MB\/s|MiB\/s|KB\/s|KiB\/s)/i);
-        if (speedMatch) {
-          const val = parseFloat(speedMatch[1]);
-          const unit = speedMatch[2].toUpperCase();
-          let bps = val * 1024 * 1024;
-          if (unit.startsWith('K')) bps = val * 1024;
-          job.currentSpeedBps = Math.round(bps);
-          job.speedHistory.push(job.currentSpeedBps);
-          if (job.speedHistory.length > 20) job.speedHistory.shift();
+
+        if (trackMatch && segMatch) {
+          const type = trackMatch[1].toUpperCase();
+          const label = trackMatch[2].trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+          const key = `${type}_${label}`;
+
+          const cur = parseInt(segMatch[1], 10);
+          const tot = parseInt(segMatch[2], 10);
+
+          let bps = 0;
+          if (speedMatch) {
+            const val = parseFloat(speedMatch[1]);
+            const unit = speedMatch[2].toUpperCase();
+            bps = unit.startsWith('K') ? val * 1024 : val * 1024 * 1024;
+          }
+
+          trackMap.set(key, { current: cur, total: tot, speedBps: bps });
+
+          // Aggregate across all tracks in multi-stream download
+          let sumCurrent = 0;
+          let sumTotal = 0;
+          let maxSpeedBps = 0;
+
+          for (const t of trackMap.values()) {
+            sumCurrent += t.current;
+            sumTotal += t.total;
+            if (t.speedBps > maxSpeedBps) {
+              maxSpeedBps = t.speedBps;
+            }
+          }
+
+          if (sumTotal > 0) {
+            job.currentSegment = sumCurrent;
+            job.totalSegments = sumTotal;
+            const overallPct = Math.min(98, Math.round((sumCurrent / sumTotal) * 100));
+            job.progress = Math.max(job.progress, overallPct);
+          }
+
+          if (maxSpeedBps > 0) {
+            job.currentSpeedBps = Math.round(maxSpeedBps);
+            job.speedHistory.push(job.currentSpeedBps);
+            if (job.speedHistory.length > 20) job.speedHistory.shift();
+          }
+
+          const remainingSegs = Math.max(0, job.totalSegments - job.currentSegment);
+          if (job.currentSegment > 0 && job.elapsedSeconds > 0) {
+            const segsPerSec = job.currentSegment / job.elapsedSeconds;
+            if (segsPerSec > 0) {
+              job.etaSeconds = Math.round(remainingSegs / segsPerSec);
+            }
+          }
+        } else if (segMatch) {
+          // Fallback single-track line matcher
+          const cur = parseInt(segMatch[1], 10);
+          const tot = parseInt(segMatch[2], 10);
+          job.currentSegment = Math.max(job.currentSegment, cur);
+          job.totalSegments = Math.max(job.totalSegments, tot);
+          if (tot > 0) {
+            const pct = Math.min(98, Math.round((cur / tot) * 100));
+            job.progress = Math.max(job.progress, pct);
+          }
         }
 
         // Invoke callback lambda on every line parsed
@@ -622,6 +675,7 @@ function runDownloadProcess(
       });
 
       child.on('close', (code) => {
+        clearInterval(timer);
         if (stdoutBuffer.trim()) handleLine(stdoutBuffer);
         if (stderrBuffer.trim()) handleLine(stderrBuffer);
 
