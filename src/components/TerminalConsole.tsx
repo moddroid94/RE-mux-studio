@@ -87,9 +87,9 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
 
   return (
     <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl shadow-2xl flex flex-col max-h-[85vh] overflow-hidden animate-in zoom-in-95 duration-150">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl shadow-2xl flex flex-col h-[85vh] max-h-[85vh] overflow-hidden animate-in zoom-in-95 duration-150">
         {/* Terminal Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-slate-950">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-slate-950 shrink-0">
           <div className="flex items-center gap-2.5">
             <span className="w-3 h-3 rounded-full bg-red-500" />
             <span className="w-3 h-3 rounded-full bg-amber-500" />
@@ -104,7 +104,7 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
           <div className="flex items-center gap-2">
             <button
               onClick={handleCopyLogs}
-              className="p-2 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg flex items-center gap-1.5 transition-colors"
+              className="p-2 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
               title="Copy All Logs"
             >
               {copied ? (
@@ -117,7 +117,7 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
 
             <button
               onClick={handleDownloadLogFile}
-              className="p-2 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg flex items-center gap-1.5 transition-colors"
+              className="p-2 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
               title="Download Log File"
             >
               <Download className="w-3.5 h-3.5 text-cyan-400" />
@@ -126,7 +126,7 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
 
             <button
               onClick={onClose}
-              className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
+              className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
             >
               <X className="w-5 h-5" />
             </button>
@@ -134,7 +134,7 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
         </div>
 
         {/* Filter Controls Bar */}
-        <div className="p-3 bg-slate-900 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+        <div className="p-3 bg-slate-900 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs font-mono shrink-0">
           <div className="relative flex-1 max-w-sm">
             <input
               type="text"
@@ -163,11 +163,11 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
         </div>
 
         {/* Main Log Lines Terminal Output */}
-        <div className="relative flex-1 min-h-0">
+        <div className="relative flex-1 min-h-0 overflow-hidden bg-slate-950">
           <div
             ref={logContainerRef}
             onScroll={handleScroll}
-            className="h-full bg-slate-950 p-6 font-mono text-xs overflow-y-auto space-y-1.5 selection:bg-cyan-500 selection:text-slate-950 leading-relaxed"
+            className="absolute inset-0 p-6 font-mono text-xs overflow-y-auto space-y-1.5 selection:bg-cyan-500 selection:text-slate-950 leading-relaxed"
           >
             {filteredLogs.length === 0 ? (
               <p className="text-slate-600 italic">No log lines matching current filter.</p>
@@ -210,7 +210,7 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
           {userScrolledUp && (
             <button
               onClick={scrollToBottom}
-              className="absolute bottom-4 right-6 px-3 py-1.5 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs rounded-full shadow-lg flex items-center gap-1.5 animate-bounce transition-all"
+              className="absolute bottom-4 right-6 px-3.5 py-1.5 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs rounded-full shadow-xl flex items-center gap-1.5 animate-bounce z-10 transition-all cursor-pointer"
             >
               <ArrowDown className="w-3.5 h-3.5" />
               <span>Scroll to Bottom</span>

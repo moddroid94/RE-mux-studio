@@ -296,8 +296,8 @@ async function startServer() {
 
       // Check discovered subtitle languages: IF both eng and ita are present download both, otherwise none
       const subLangs = discoveredLangs.sub.map((s) => s.toLowerCase());
-      const hasEngSub = subLangs.some((s) => s.includes('eng') || s === 'en');
-      const hasItaSub = subLangs.some((s) => s.includes('ita') || s === 'it');
+      const hasEngSub = subLangs.some((s) => s.includes('eng'));
+      const hasItaSub = subLangs.some((s) => s.includes('ita'));
       let subFlag = ''
       if (hasEngSub ) {
         if (hasItaSub) {
