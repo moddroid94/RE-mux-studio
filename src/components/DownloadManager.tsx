@@ -43,17 +43,34 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
   ).length;
 
   const totalSpeedBps = jobs.reduce((sum, j) => sum + (j.currentSpeedBps || 0), 0);
-  const totalSpeedMb = (totalSpeedBps / (1024 * 1024)).toFixed(1);
+
+  const formatSpeed = (bps: number) => {
+    if (bps >= 1073741824) return `${(bps / 1073741824).toFixed(2)} GB/s`;
+    if (bps >= 1048576) return `${(bps / 1048576).toFixed(2)} MB/s`;
+    if (bps >= 1024) return `${(bps / 1024).toFixed(0)} KB/s`;
+    return `${bps} B/s`;
+  };
 
   const formatBytes = (bytes: number) => {
-    if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(2)} GB`;
-    if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
+    if (bytes <= 0) return '0 MB';
+    if (bytes >= 1073741824) {
+      const gb = bytes / 1073741824;
+      return `${gb % 1 === 0 ? gb.toFixed(0) : gb.toFixed(2)} GB`;
+    }
+    if (bytes >= 1048576) {
+      const mb = bytes / 1048576;
+      return `${mb % 1 === 0 ? mb.toFixed(0) : mb.toFixed(1)} MB`;
+    }
     return `${Math.round(bytes / 1024)} KB`;
   };
 
   const formatSeconds = (secs: number) => {
-    const m = Math.floor(secs / 60);
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
     const s = Math.floor(secs % 60);
+    if (h > 0) {
+      return `${h}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+    }
     return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
@@ -98,7 +115,7 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
               Aggregate Speed
             </span>
             <div className="text-xl font-black text-emerald-400 font-mono">
-              {totalSpeedMb} MB/s
+              {formatSpeed(totalSpeedBps)}
             </div>
           </div>
 
@@ -276,7 +293,7 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
                     <Gauge className="w-4 h-4 text-emerald-400" />
                     <div>
                       <span className="text-slate-500 block text-[10px]">CURRENT SPEED</span>
-                      <strong className="text-emerald-400 font-bold">{speedMb} MB/s</strong>
+                      <strong className="text-emerald-400 font-bold">{formatSpeed(job.currentSpeedBps)}</strong>
                     </div>
                   </div>
 

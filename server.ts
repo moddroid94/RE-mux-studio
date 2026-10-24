@@ -150,9 +150,13 @@ async function startServer() {
       const { url, title, commandExecuted, selectionsSummary, commandConfig } = req.body;
 
       const jobId = 'job_' + Date.now();
+      const saveNameMatch = commandExecuted?.match(/--save-name\s+"([^"]+)"/) || commandExecuted?.match(/--save-name\s+([^\s]+)/);
+      const formatMatch = commandExecuted?.match(/-M\s+format=([a-zA-Z0-9]+)/) || commandExecuted?.match(/format=([a-zA-Z0-9]+)/);
+
       const safeTitle = (title || 'Stream').replace(/[^a-zA-Z0-9_-]/g, '_');
-      const containerFormat = commandConfig?.containerFormat || 'mkv';
-      const outputFilename = `${safeTitle}_${jobId.slice(-4)}.${containerFormat}`;
+      const saveName = saveNameMatch ? saveNameMatch[1] : safeTitle;
+      const containerFormat = formatMatch ? formatMatch[1] : (commandConfig?.containerFormat || 'mkv');
+      const outputFilename = `${saveName}.${containerFormat}`;
 
       const newJob: DownloadJob = {
         id: jobId,
@@ -544,8 +548,8 @@ function runDownloadProcess(
         env: {
           ...process.env,
           TERM: 'xterm-256color',
-          COLUMNS: '160',
-          LINES: '50',
+          COLUMNS: '240',
+          LINES: '60',
         },
       });
       item.process = child;
@@ -561,12 +565,32 @@ function runDownloadProcess(
       const trackMap = new Map<string, { current: number; total: number; speedBps: number }>();
       const startTimestamp = Date.now();
 
+      const parseBytes = (valStr: string, unitStr?: string): number => {
+        const val = parseFloat(valStr);
+        if (isNaN(val)) return 0;
+        const unit = (unitStr || '').toUpperCase();
+        if (unit.startsWith('G')) return Math.round(val * 1024 * 1024 * 1024);
+        if (unit.startsWith('M')) return Math.round(val * 1024 * 1024);
+        if (unit.startsWith('K')) return Math.round(val * 1024);
+        return Math.round(val);
+      };
+
       const timer = setInterval(() => {
         if (job.status === 'completed' || job.status === 'failed') {
           clearInterval(timer);
           return;
         }
         job.elapsedSeconds = Math.max(1, Math.floor((Date.now() - startTimestamp) / 1000));
+
+        if (job.currentSpeedBps > 0 && job.status.includes('downloading')) {
+          if (job.downloadedBytes === 0) {
+            job.downloadedBytes += job.currentSpeedBps;
+          }
+          if (job.progress > 0 && (job.totalBytes <= 0 || job.totalBytes < job.downloadedBytes)) {
+            job.totalBytes = Math.round(job.downloadedBytes / (job.progress / 100));
+          }
+        }
+
         reportProgress();
       }, 1000);
 
@@ -590,9 +614,107 @@ function runDownloadProcess(
           job.status = 'muxing';
         }
 
-        const trackMatch = cleanLine.match(/^(Vid|Aud|Sub)\*?\s*([^|]+)/i) || cleanLine.match(/(Vid|Aud|Sub)\*?\s*([\w\-]+)/i);
+        const saveNameLogMatch = cleanLine.match(/Save Name:\s*(.+)/i);
+        if (saveNameLogMatch) {
+          const parsedSaveName = saveNameLogMatch[1].trim();
+          if (parsedSaveName) {
+            const currentExt = job.outputFile.includes('.') ? job.outputFile.split('.').pop() : 'mp4';
+            job.outputFile = `${parsedSaveName}.${currentExt}`;
+          }
+        }
+
         const segMatch = cleanLine.match(/(\d+)\s*\/\s*(\d+)/);
-        const speedMatch = cleanLine.match(/([\d.]+)\s*(MB\/s|MiB\/s|KB\/s|KiB\/s)/i);
+        const searchTarget = segMatch && segMatch.index !== undefined
+          ? cleanLine.substring(segMatch.index)
+          : cleanLine;
+
+        // Extract Size (e.g. 246MB/250, 241.46MB/1, 241.46MB/1.48GB, or 15.20MB/150MB)
+        const sizeMatch = searchTarget.match(/([\d.]+)\s*(GB|GiB|MB|MiB|KB|KiB|B)\s*\/\s*([\d.]+)\s*(GB|GiB|MB|MiB|KB|KiB|B)?/i);
+        if (sizeMatch) {
+          const dlVal = sizeMatch[1];
+          const dlUnit = sizeMatch[2];
+          const totVal = sizeMatch[3];
+          const explicitTotUnit = sizeMatch[4];
+
+          const dlBytes = parseBytes(dlVal, dlUnit);
+          if (dlBytes > 0) {
+            job.downloadedBytes = dlBytes;
+          }
+
+          const dlValNum = parseFloat(dlVal);
+          const totValNum = parseFloat(totVal);
+          let totBytes = 0;
+
+          if (explicitTotUnit) {
+            totBytes = parseBytes(totVal, explicitTotUnit);
+          } else if (!isNaN(totValNum)) {
+            if (totValNum >= dlValNum) {
+              // e.g. 246MB/250 -> 250 is in same unit (MB)
+              totBytes = parseBytes(totVal, dlUnit);
+            } else {
+              // e.g. 241.46MB/1 or 241.46MB/1.5 -> totVal is in GB
+              const higherUnit = dlUnit.toUpperCase().startsWith('K') ? 'MB' : dlUnit.toUpperCase().startsWith('M') ? 'GB' : 'TB';
+              totBytes = parseBytes(totVal, higherUnit);
+            }
+          }
+
+          if (job.progress > 0 && dlBytes > 0) {
+            const calculatedTotal = Math.round(dlBytes / (job.progress / 100));
+            if (calculatedTotal >= dlBytes) {
+              if (totBytes === 0 || Math.abs(calculatedTotal - totBytes) / totBytes > 0.1) {
+                totBytes = calculatedTotal;
+              }
+            }
+          }
+
+          if (totBytes >= dlBytes) {
+            job.totalBytes = totBytes;
+          }
+        }
+
+        // Extract Speed (e.g. 2.66MBps, 12.5MB/s, 850KBps)
+        const speedMatch = searchTarget.match(/([\d.]+)\s*(GBps|GiBps|MBps|MiBps|KBps|KiBps|Bps|GB\/s|GiB\/s|MB\/s|MiB\/s|KB\/s|KiB\/s|B\/s|M\/s|K\/s|Gbps|Mbps|Kbps)/i);
+        if (speedMatch) {
+          const val = parseFloat(speedMatch[1]);
+          const unit = speedMatch[2].toUpperCase();
+          let bps = 0;
+          if (unit.startsWith('G')) {
+            bps = val * 1024 * 1024 * 1024;
+          } else if (unit.startsWith('M')) {
+            bps = val * 1024 * 1024;
+          } else if (unit.startsWith('K')) {
+            bps = val * 1024;
+          } else {
+            bps = val;
+          }
+          if (bps > 0) {
+            job.currentSpeedBps = Math.round(bps);
+            job.speedHistory.push(job.currentSpeedBps);
+            if (job.speedHistory.length > 20) job.speedHistory.shift();
+          }
+        }
+
+        // Extract ETA (e.g. 00:07:33 or ~01h29m33s)
+        const etaMatch = searchTarget.match(/\b(\d{2}):(\d{2}):(\d{2})\b/);
+        let hasDirectEta = false;
+        if (etaMatch) {
+          const h = parseInt(etaMatch[1], 10);
+          const m = parseInt(etaMatch[2], 10);
+          const s = parseInt(etaMatch[3], 10);
+          job.etaSeconds = h * 3600 + m * 60 + s;
+          hasDirectEta = true;
+        } else {
+          const etaHMSSMatch = searchTarget.match(/~(\d+)h(\d+)m(\d+)s/i);
+          if (etaHMSSMatch) {
+            const h = parseInt(etaHMSSMatch[1], 10);
+            const m = parseInt(etaHMSSMatch[2], 10);
+            const s = parseInt(etaHMSSMatch[3], 10);
+            job.etaSeconds = h * 3600 + m * 60 + s;
+            hasDirectEta = true;
+          }
+        }
+
+        const trackMatch = cleanLine.match(/^(Vid|Aud|Sub)\*?\s*([^|]+)/i) || cleanLine.match(/(Vid|Aud|Sub)\*?\s*([\w\-]+)/i);
 
         if (trackMatch && segMatch) {
           const type = trackMatch[1].toUpperCase();
@@ -602,26 +724,15 @@ function runDownloadProcess(
           const cur = parseInt(segMatch[1], 10);
           const tot = parseInt(segMatch[2], 10);
 
-          let bps = 0;
-          if (speedMatch) {
-            const val = parseFloat(speedMatch[1]);
-            const unit = speedMatch[2].toUpperCase();
-            bps = unit.startsWith('K') ? val * 1024 : val * 1024 * 1024;
-          }
-
-          trackMap.set(key, { current: cur, total: tot, speedBps: bps });
+          trackMap.set(key, { current: cur, total: tot, speedBps: job.currentSpeedBps });
 
           // Aggregate across all tracks in multi-stream download
           let sumCurrent = 0;
           let sumTotal = 0;
-          let maxSpeedBps = 0;
 
           for (const t of trackMap.values()) {
             sumCurrent += t.current;
             sumTotal += t.total;
-            if (t.speedBps > maxSpeedBps) {
-              maxSpeedBps = t.speedBps;
-            }
           }
 
           if (sumTotal > 0) {
@@ -631,17 +742,13 @@ function runDownloadProcess(
             job.progress = Math.max(job.progress, overallPct);
           }
 
-          if (maxSpeedBps > 0) {
-            job.currentSpeedBps = Math.round(maxSpeedBps);
-            job.speedHistory.push(job.currentSpeedBps);
-            if (job.speedHistory.length > 20) job.speedHistory.shift();
-          }
-
-          const remainingSegs = Math.max(0, job.totalSegments - job.currentSegment);
-          if (job.currentSegment > 0 && job.elapsedSeconds > 0) {
-            const segsPerSec = job.currentSegment / job.elapsedSeconds;
-            if (segsPerSec > 0) {
-              job.etaSeconds = Math.round(remainingSegs / segsPerSec);
+          if (!hasDirectEta) {
+            const remainingSegs = Math.max(0, job.totalSegments - job.currentSegment);
+            if (job.currentSegment > 0 && job.elapsedSeconds > 0) {
+              const segsPerSec = job.currentSegment / job.elapsedSeconds;
+              if (segsPerSec > 0) {
+                job.etaSeconds = Math.round(remainingSegs / segsPerSec);
+              }
             }
           }
         } else if (segMatch) {
@@ -654,6 +761,10 @@ function runDownloadProcess(
             const pct = Math.min(98, Math.round((cur / tot) * 100));
             job.progress = Math.max(job.progress, pct);
           }
+        }
+
+        if (job.progress > 0 && job.downloadedBytes > 0 && (job.totalBytes <= 0 || job.totalBytes < job.downloadedBytes)) {
+          job.totalBytes = Math.round(job.downloadedBytes / (job.progress / 100));
         }
 
         // Invoke callback lambda on every line parsed
@@ -682,12 +793,31 @@ function runDownloadProcess(
         let finalSizeBytes = 0;
         try {
           const files = fs.readdirSync(DOWNLOADS_DIR);
-          const baseName = outputFilename.split('.')[0].toLowerCase();
-          const matched = files.find(f => f.toLowerCase().includes(baseName));
-          if (matched) {
-            finalSizeBytes = fs.statSync(path.join(DOWNLOADS_DIR, matched)).size;
-          } else if (fs.existsSync(path.join(DOWNLOADS_DIR, outputFilename))) {
-            finalSizeBytes = fs.statSync(path.join(DOWNLOADS_DIR, outputFilename)).size;
+
+          let resolvedFile = job.outputFile;
+          if (fs.existsSync(path.join(DOWNLOADS_DIR, job.outputFile))) {
+            resolvedFile = job.outputFile;
+          } else {
+            const baseName = job.outputFile.split('.')[0].toLowerCase();
+            const matched = files.find((f) => f.toLowerCase().includes(baseName) || baseName.includes(f.split('.')[0].toLowerCase()));
+            if (matched) {
+              resolvedFile = matched;
+            } else {
+              const mediaExts = ['.mp4', '.mkv', '.ts', '.m4a', '.webm', '.mov', '.mp3', '.aac'];
+              const sorted = files
+                .filter((f) => mediaExts.some((ext) => f.toLowerCase().endsWith(ext)))
+                .map((f) => ({ name: f, mtime: fs.statSync(path.join(DOWNLOADS_DIR, f)).mtimeMs }))
+                .sort((a, b) => b.mtime - a.mtime);
+
+              if (sorted.length > 0) {
+                resolvedFile = sorted[0].name;
+              }
+            }
+          }
+
+          if (fs.existsSync(path.join(DOWNLOADS_DIR, resolvedFile))) {
+            job.outputFile = resolvedFile;
+            finalSizeBytes = fs.statSync(path.join(DOWNLOADS_DIR, resolvedFile)).size;
           }
         } catch {
           // ignore
@@ -703,7 +833,7 @@ function runDownloadProcess(
           job.progress = 100;
           job.etaSeconds = 0;
           const sizeMb = (job.downloadedBytes / (1024 * 1024)).toFixed(1);
-          addLog(job, 'info', `[SUCCESS] Download completed! Output file: /downloads/${outputFilename} (${sizeMb} MB)`);
+          addLog(job, 'info', `[SUCCESS] Download completed! Output file: /downloads/${job.outputFile} (${sizeMb} MB)`);
         } else {
           job.status = 'failed';
           job.error = `Process exited with code ${code}`;
