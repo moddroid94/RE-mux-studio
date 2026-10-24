@@ -48,28 +48,94 @@ const HAS_FFMPEG = checkSystemBinary('ffmpeg');
 console.log(`[RE-Mux System Check] N_m3u8DL-RE Binary: ${HAS_NM3U8DL ? 'INSTALLED' : 'NOT FOUND (Docker mode)'}`);
 console.log(`[RE-Mux System Check] FFmpeg Binary: ${HAS_FFMPEG ? 'INSTALLED' : 'NOT FOUND (Docker mode)'}`);
 
-const lastJobNotificationTimeMap = new Map<string, number>();
-let lastGlobalNotificationTime = 0;
+const MIN_PACE_MS = 1000; // Strict: max 1 broadcast every 1000ms (prevents high-frequency floods)
 
-// Notify all registered progress lambdas (throttled to at most once per second per job unless forced)
-function notifyJobProgress(job: DownloadJob, force = false) {
+let lastGlobalBroadcastTime = 0;
+let globalTrailingTimer: NodeJS.Timeout | null = null;
+
+function broadcastGlobalJobs(forceNow = false) {
   const now = Date.now();
-  const lastJobTime = lastJobNotificationTimeMap.get(job.id) || 0;
+  const elapsed = now - lastGlobalBroadcastTime;
 
-  if (!force && now - lastJobTime < 1000) {
+  if (forceNow && elapsed >= MIN_PACE_MS) {
+    if (globalTrailingTimer) {
+      clearTimeout(globalTrailingTimer);
+      globalTrailingTimer = null;
+    }
+    lastGlobalBroadcastTime = now;
+    globalProgressListeners.forEach((cb) => {
+      try { cb(); } catch {}
+    });
     return;
   }
-  lastJobNotificationTimeMap.set(job.id, now);
 
-  const listeners = jobProgressListenerMap.get(job.id);
-  if (listeners) {
-    listeners.forEach((cb) => cb(job));
+  if (elapsed >= MIN_PACE_MS) {
+    if (globalTrailingTimer) {
+      clearTimeout(globalTrailingTimer);
+      globalTrailingTimer = null;
+    }
+    lastGlobalBroadcastTime = now;
+    globalProgressListeners.forEach((cb) => {
+      try { cb(); } catch {}
+    });
+    return;
   }
 
-  if (force || now - lastGlobalNotificationTime >= 1000) {
-    lastGlobalNotificationTime = now;
-    globalProgressListeners.forEach((cb) => cb());
+  // If within cooldown period, schedule exactly one trailing timer if not already scheduled
+  if (!globalTrailingTimer) {
+    const delay = Math.max(50, MIN_PACE_MS - elapsed);
+    globalTrailingTimer = setTimeout(() => {
+      globalTrailingTimer = null;
+      lastGlobalBroadcastTime = Date.now();
+      globalProgressListeners.forEach((cb) => {
+        try { cb(); } catch {}
+      });
+    }, delay);
   }
+}
+
+const jobLastBroadcastTimeMap = new Map<string, number>();
+const jobTrailingTimerMap = new Map<string, NodeJS.Timeout>();
+
+function broadcastJobProgress(job: DownloadJob) {
+  const now = Date.now();
+  const lastTime = jobLastBroadcastTimeMap.get(job.id) || 0;
+  const elapsed = now - lastTime;
+
+  const emit = () => {
+    jobLastBroadcastTimeMap.set(job.id, Date.now());
+    const listeners = jobProgressListenerMap.get(job.id);
+    if (listeners) {
+      listeners.forEach((cb) => {
+        try { cb(job); } catch {}
+      });
+    }
+  };
+
+  if (elapsed >= MIN_PACE_MS) {
+    const existing = jobTrailingTimerMap.get(job.id);
+    if (existing) {
+      clearTimeout(existing);
+      jobTrailingTimerMap.delete(job.id);
+    }
+    emit();
+    return;
+  }
+
+  if (!jobTrailingTimerMap.has(job.id)) {
+    const delay = Math.max(50, MIN_PACE_MS - elapsed);
+    const timer = setTimeout(() => {
+      jobTrailingTimerMap.delete(job.id);
+      emit();
+    }, delay);
+    jobTrailingTimerMap.set(job.id, timer);
+  }
+}
+
+// Strictly paced notification function - cannot bypass 1000ms minimum window
+function notifyJobProgress(job: DownloadJob, force = false) {
+  broadcastJobProgress(job);
+  broadcastGlobalJobs(force);
 }
 
 async function startServer() {
@@ -237,10 +303,8 @@ async function startServer() {
       const internalJob: ActiveJobInternal = { job: newJob };
       activeJobsStore.set(jobId, internalJob);
 
-      // Launch process with callback lambda for instant progress reporting
-      runDownloadProcess(jobId, url, commandExecuted, commandConfig, outputFilename, (updatedJob) => {
-        notifyJobProgress(updatedJob);
-      });
+      // Launch process with paced background progress reporting
+      runDownloadProcess(jobId, url, commandExecuted, commandConfig, outputFilename);
 
       return res.json({ success: true, job: newJob });
     } catch (err: any) {
@@ -428,16 +492,13 @@ async function startServer() {
       const internalJob: ActiveJobInternal = { job: newJob };
       activeJobsStore.set(jobId, internalJob);
 
-      // Launch process with callback lambda for instant progress reporting
+      // Launch process with paced background progress reporting
       runDownloadProcess(
         jobId,
         targetUrl,
         commandExecuted,
         { containerFormat: 'mp4' },
-        outputFilename,
-        (updatedJob) => {
-          notifyJobProgress(updatedJob);
-        }
+        outputFilename
       );
 
       return res.json({
@@ -465,21 +526,29 @@ async function startServer() {
     res.setHeader('X-Accel-Buffering', 'no');
 
     const sendAllJobs = () => {
+      if (res.writableEnded || res.closed) return;
       const jobs = Array.from(activeJobsStore.values()).map((ij) => ij.job);
       res.write(`data: ${JSON.stringify({ jobs })}\n\n`);
     };
 
     sendAllJobs();
 
-    // Register callback lambda for instant global progress updates
+    // Register callback lambda for strictly paced global updates (max 1/sec)
     const globalProgressLambda = () => sendAllJobs();
     globalProgressListeners.add(globalProgressLambda);
 
-    const interval = setInterval(sendAllJobs, 2000);
+    // Keep-alive heartbeat every 15s (does not spam full job state)
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded || res.closed) {
+        clearInterval(heartbeat);
+        return;
+      }
+      res.write(': keepalive\n\n');
+    }, 15000);
 
     req.on('close', () => {
       globalProgressListeners.delete(globalProgressLambda);
-      clearInterval(interval);
+      clearInterval(heartbeat);
     });
   });
 
@@ -498,23 +567,31 @@ async function startServer() {
     res.setHeader('X-Accel-Buffering', 'no');
 
     const sendJobUpdate = (updatedJob: DownloadJob) => {
+      if (res.writableEnded || res.closed) return;
       res.write(`data: ${JSON.stringify({ job: updatedJob })}\n\n`);
     };
 
     sendJobUpdate(item.job);
 
-    // Register callback lambda for instant per-job progress updates
+    // Register callback lambda for strictly paced per-job updates (max 1/sec)
     if (!jobProgressListenerMap.has(jobId)) {
       jobProgressListenerMap.set(jobId, new Set());
     }
     const jobListeners = jobProgressListenerMap.get(jobId)!;
     jobListeners.add(sendJobUpdate);
 
-    const timer = setInterval(() => sendJobUpdate(item.job), 2000);
+    // Keep-alive heartbeat every 15s
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded || res.closed) {
+        clearInterval(heartbeat);
+        return;
+      }
+      res.write(': keepalive\n\n');
+    }, 15000);
 
     req.on('close', () => {
       jobListeners.delete(sendJobUpdate);
-      clearInterval(timer);
+      clearInterval(heartbeat);
     });
   });
 
@@ -874,14 +951,13 @@ function locateAndRelocateOutputFile(targetFilename: string): { filename: string
   return { filename: targetFilename, bytes: 0 };
 }
 
-// Real Process Execution Engine with Callback Lambda Reporting
+// Real Process Execution Engine with Strictly Paced Event Reporting
 function runDownloadProcess(
   jobId: string,
   url: string,
   commandExecuted: string,
   commandConfig: any,
-  outputFilename: string,
-  onProgressUpdate?: (job: DownloadJob) => void
+  outputFilename: string
 ) {
   const item = activeJobsStore.get(jobId);
   if (!item) return;
@@ -892,9 +968,6 @@ function runDownloadProcess(
   // Callback helper lambda
   const reportProgress = (force = false) => {
     notifyJobProgress(job, force);
-    if (onProgressUpdate) {
-      onProgressUpdate(job);
-    }
   };
 
   if (binaryToUse) {
@@ -1159,8 +1232,10 @@ function runDownloadProcess(
           job.totalBytes = Math.round(job.downloadedBytes / (job.progress / 100));
         }
 
-        // Invoke callback lambda (throttled to max 1 update/sec, unless status changed)
-        reportProgress(oldStatus !== job.status);
+        // State updated in memory. Paced SSE emissions are strictly handled once per second by the interval timer.
+        if (oldStatus !== job.status && (job.status === 'muxing' || oldStatus === 'muxing')) {
+          reportProgress();
+        }
       };
 
       child.stdout?.on('data', (chunk: Buffer) => {
@@ -1200,14 +1275,14 @@ function runDownloadProcess(
           job.error = `Process exited with code ${code}`;
           addLog(job, 'error', `[ERROR] Process exited with non-zero status code ${code}`);
         }
-        reportProgress();
+        reportProgress(true);
       });
 
       child.on('error', (err) => {
         job.status = 'failed';
         job.error = err.message;
         addLog(job, 'error', `[ERROR] Failed to launch binary process: ${err.message}`);
-        reportProgress();
+        reportProgress(true);
       });
 
       return;
