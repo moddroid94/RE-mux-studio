@@ -1,1 +1,26 @@
 @import "tailwindcss";
+
+/* Ensure visible scrollbars across all browsers (Chrome, Edge, Safari, Firefox) */
+* {
+  scrollbar-color: #475569 #090d16;
+  scrollbar-width: thin;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #090d16;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 5px;
+  border: 2px solid #090d16;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #06b6d4;
+}

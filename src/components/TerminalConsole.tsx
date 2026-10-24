@@ -25,31 +25,50 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
   const [levelFilter, setLevelFilter] = useState<string>('all');
   const [userScrolledUp, setUserScrolledUp] = useState(false);
   const logContainerRef = useRef<HTMLDivElement | null>(null);
+  const isAtBottomRef = useRef(true);
 
   const lastLogId = job?.logs[job.logs.length - 1]?.id;
 
-  // Auto-scroll to bottom of terminal output as new log lines arrive
+  // Auto-scroll to bottom only when new log arrives AND user is at the bottom
   useEffect(() => {
-    if (logContainerRef.current && !userScrolledUp) {
+    if (logContainerRef.current && isAtBottomRef.current) {
       const el = logContainerRef.current;
       requestAnimationFrame(() => {
-        el.scrollTop = el.scrollHeight;
+        if (isAtBottomRef.current && el) {
+          el.scrollTop = el.scrollHeight;
+        }
       });
     }
-  }, [job?.logs, lastLogId, searchQuery, levelFilter, userScrolledUp]);
+  }, [lastLogId]);
+
+  // Initial scroll to bottom on mount
+  useEffect(() => {
+    if (logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  }, []);
 
   const handleScroll = () => {
     if (logContainerRef.current) {
       const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
-      const isBottom = scrollHeight - scrollTop - clientHeight < 30;
-      setUserScrolledUp(!isBottom);
+      const atBottom = scrollHeight - scrollTop - clientHeight < 40;
+      isAtBottomRef.current = atBottom;
+      setUserScrolledUp(!atBottom);
+    }
+  };
+
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    if (e.deltaY < 0) {
+      isAtBottomRef.current = false;
+      setUserScrolledUp(true);
     }
   };
 
   const scrollToBottom = () => {
     if (logContainerRef.current) {
-      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+      isAtBottomRef.current = true;
       setUserScrolledUp(false);
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
   };
 
@@ -163,11 +182,13 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
         </div>
 
         {/* Main Log Lines Terminal Output */}
-        <div className="relative flex-1 min-h-0 overflow-hidden bg-slate-950">
+        <div className="relative flex-1 min-h-0 flex flex-col bg-slate-950">
           <div
             ref={logContainerRef}
             onScroll={handleScroll}
-            className="absolute inset-0 p-6 font-mono text-xs overflow-y-auto space-y-1.5 selection:bg-cyan-500 selection:text-slate-950 leading-relaxed"
+            onWheel={handleWheel}
+            className="flex-1 min-h-0 p-6 font-mono text-xs space-y-1.5 selection:bg-cyan-500 selection:text-slate-950 leading-relaxed text-slate-300"
+            style={{ overflowY: 'scroll', scrollbarGutter: 'stable' }}
           >
             {filteredLogs.length === 0 ? (
               <p className="text-slate-600 italic">No log lines matching current filter.</p>
@@ -210,7 +231,7 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
           {userScrolledUp && (
             <button
               onClick={scrollToBottom}
-              className="absolute bottom-4 right-6 px-3.5 py-1.5 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs rounded-full shadow-xl flex items-center gap-1.5 animate-bounce z-10 transition-all cursor-pointer"
+              className="absolute bottom-4 right-6 px-3.5 py-1.5 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs rounded-full shadow-2xl flex items-center gap-1.5 animate-bounce z-20 transition-all cursor-pointer"
             >
               <ArrowDown className="w-3.5 h-3.5" />
               <span>Scroll to Bottom</span>

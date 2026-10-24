@@ -1,11 +1,17 @@
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Clock,
+  Copy,
   Download,
   FileVideo,
   Gauge,
+  Info,
   Layers,
+  Link,
   Pause,
   Play,
   Sparkles,
@@ -29,6 +35,28 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
   onNewStreamClick,
 }) => {
   const [filterStatus, setFilterStatus] = useState<string>('all');
+  const [expandedJobIds, setExpandedJobIds] = useState<Record<string, boolean>>({});
+  const [copiedCommandId, setCopiedCommandId] = useState<string | null>(null);
+  const [copiedUrlId, setCopiedUrlId] = useState<string | null>(null);
+
+  const toggleJobDetails = (id: string) => {
+    setExpandedJobIds((prev) => ({
+      ...prev,
+      [id]: !prev[id],
+    }));
+  };
+
+  const handleCopyCommand = (id: string, cmd: string) => {
+    navigator.clipboard.writeText(cmd);
+    setCopiedCommandId(id);
+    setTimeout(() => setCopiedCommandId(null), 2000);
+  };
+
+  const handleCopyUrl = (id: string, url: string) => {
+    navigator.clipboard.writeText(url);
+    setCopiedUrlId(id);
+    setTimeout(() => setCopiedUrlId(null), 2000);
+  };
 
   const filteredJobs = jobs.filter((j) => {
     if (filterStatus === 'active')
@@ -248,6 +276,24 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
                       <Terminal className="w-3.5 h-3.5" /> Terminal Logs
                     </button>
 
+                    <button
+                      onClick={() => toggleJobDetails(job.id)}
+                      className={`px-3 py-1.5 text-xs font-bold border rounded-lg flex items-center gap-1.5 transition-colors ${
+                        expandedJobIds[job.id]
+                          ? 'text-cyan-300 bg-cyan-950/60 border-cyan-600/70'
+                          : 'text-slate-300 bg-slate-800 hover:bg-slate-700 border-slate-700'
+                      }`}
+                      title="Toggle detailed task info & command"
+                    >
+                      <Info className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>Details</span>
+                      {expandedJobIds[job.id] ? (
+                        <ChevronUp className="w-3.5 h-3.5 text-cyan-400" />
+                      ) : (
+                        <ChevronDown className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+
                     {job.status === 'completed' && (
                       <a
                         href={`/api/download/file/${encodeURIComponent(job.outputFile)}`}
@@ -326,15 +372,189 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
                   </div>
                 </div>
 
-                {/* Selections Summary */}
+                {/* Selections Summary Footer & Spoiler Toggle */}
                 <div className="text-xs font-mono text-slate-400 pt-1 flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80">
                   <span>
                     Tracks: <strong className="text-cyan-300">{job.selectionsSummary.video}</strong> |{' '}
                     <strong className="text-emerald-300">{job.selectionsSummary.audio.length} Audio Tracks</strong> |{' '}
                     <strong className="text-purple-300">{job.selectionsSummary.subtitles.length} Subtitles</strong>
                   </span>
-                  <span className="text-slate-500">Created: {job.createdAt.substring(11, 19)}</span>
+                  <div className="flex items-center gap-3">
+                    <span className="text-slate-500">Created: {job.createdAt.substring(11, 19)}</span>
+                    <button
+                      onClick={() => toggleJobDetails(job.id)}
+                      className="inline-flex items-center gap-1 text-[11px] font-bold text-cyan-400 hover:text-cyan-300 transition-colors py-0.5 px-2 rounded bg-slate-950 border border-slate-800 hover:border-slate-700"
+                    >
+                      <span>{expandedJobIds[job.id] ? 'Hide Info' : 'Show Info & Command'}</span>
+                      {expandedJobIds[job.id] ? (
+                        <ChevronUp className="w-3.5 h-3.5" />
+                      ) : (
+                        <ChevronDown className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                  </div>
                 </div>
+
+                {/* Expandable Details Spoiler Section */}
+                {expandedJobIds[job.id] && (
+                  <div className="pt-3 border-t border-slate-800 space-y-4 animate-in fade-in duration-150">
+                    {/* Error Banner if task has failed */}
+                    {job.error && (
+                      <div className="p-3 bg-red-950/40 border border-red-900/60 rounded-xl flex items-start gap-2.5 text-xs text-red-300 font-mono">
+                        <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                        <div>
+                          <strong className="font-bold block text-red-200">Error / Abort Details:</strong>
+                          <span>{job.error}</span>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Source URL & Target File Grid */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs font-mono">
+                      {/* Stream URL */}
+                      <div className="bg-slate-950 p-3 rounded-xl border border-slate-800/80 space-y-1.5">
+                        <div className="flex items-center justify-between text-slate-400">
+                          <span className="text-[10px] uppercase font-bold text-slate-400 flex items-center gap-1.5">
+                            <Link className="w-3 h-3 text-cyan-400" /> Source Manifest URL
+                          </span>
+                          <button
+                            onClick={() => handleCopyUrl(job.id, job.url)}
+                            className="flex items-center gap-1 text-[11px] text-cyan-400 hover:text-cyan-300 transition-colors font-semibold"
+                            title="Copy Manifest URL"
+                          >
+                            {copiedUrlId === job.id ? (
+                              <Check className="w-3 h-3 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3 h-3" />
+                            )}
+                            <span>{copiedUrlId === job.id ? 'Copied' : 'Copy URL'}</span>
+                          </button>
+                        </div>
+                        <div className="text-slate-300 break-all select-all line-clamp-3 bg-slate-900/70 p-2 rounded-lg border border-slate-800/60 text-[11px]">
+                          {job.url}
+                        </div>
+                      </div>
+
+                      {/* Destination Target File */}
+                      <div className="bg-slate-950 p-3 rounded-xl border border-slate-800/80 space-y-1.5">
+                        <div className="flex items-center justify-between text-slate-400">
+                          <span className="text-[10px] uppercase font-bold text-slate-400 flex items-center gap-1.5">
+                            <FileVideo className="w-3 h-3 text-purple-400" /> Output Target (.mp4 / .mkv)
+                          </span>
+                          <span className="text-[10px] text-slate-500">./downloads</span>
+                        </div>
+                        <div className="text-purple-300 font-bold break-all bg-slate-900/70 p-2 rounded-lg border border-slate-800/60 text-[11px]">
+                          {job.outputFile}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Stream Selections Detailed Breakdown */}
+                    <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800/80 space-y-3 font-mono text-xs">
+                      <div className="text-[10px] uppercase font-bold text-slate-400 flex items-center gap-1.5">
+                        <Layers className="w-3 h-3 text-cyan-400" /> Selected Stream Tracks Breakdown
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                        {/* Video */}
+                        <div className="bg-slate-900/80 p-2.5 rounded-lg border border-slate-800/60 space-y-1.5">
+                          <span className="text-[10px] text-slate-400 uppercase block font-semibold">Video Resolution</span>
+                          <span className="inline-block px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/30 font-bold text-[11px]">
+                            {job.selectionsSummary.video || 'Best / Auto'}
+                          </span>
+                        </div>
+
+                        {/* Audio */}
+                        <div className="bg-slate-900/80 p-2.5 rounded-lg border border-slate-800/60 space-y-1.5">
+                          <span className="text-[10px] text-slate-400 uppercase block font-semibold">
+                            Audio Tracks ({job.selectionsSummary.audio.length})
+                          </span>
+                          <div className="flex flex-wrap gap-1">
+                            {job.selectionsSummary.audio.length > 0 ? (
+                              job.selectionsSummary.audio.map((aud, idx) => (
+                                <span
+                                  key={idx}
+                                  className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 text-[11px] font-semibold"
+                                >
+                                  {aud}
+                                </span>
+                              ))
+                            ) : (
+                              <span className="text-slate-500 italic text-[11px]">All / Default audio</span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Subtitles */}
+                        <div className="bg-slate-900/80 p-2.5 rounded-lg border border-slate-800/60 space-y-1.5">
+                          <span className="text-[10px] text-slate-400 uppercase block font-semibold">
+                            Subtitle Tracks ({job.selectionsSummary.subtitles.length})
+                          </span>
+                          <div className="flex flex-wrap gap-1">
+                            {job.selectionsSummary.subtitles.length > 0 ? (
+                              job.selectionsSummary.subtitles.map((sub, idx) => (
+                                <span
+                                  key={idx}
+                                  className="px-2 py-0.5 rounded bg-purple-500/10 text-purple-300 border border-purple-500/30 text-[11px] font-semibold"
+                                >
+                                  {sub}
+                                </span>
+                              ))
+                            ) : (
+                              <span className="text-slate-500 italic text-[11px]">None selected</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Executed CLI Command */}
+                    {job.commandExecuted && (
+                      <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800/80 space-y-2 font-mono text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] uppercase font-bold text-slate-400 flex items-center gap-1.5">
+                            <Terminal className="w-3 h-3 text-cyan-400" /> CLI Command Executed
+                          </span>
+                          <button
+                            onClick={() => handleCopyCommand(job.id, job.commandExecuted)}
+                            className="flex items-center gap-1 text-[11px] text-cyan-400 hover:text-cyan-300 font-semibold transition-colors bg-slate-900 hover:bg-slate-800 px-2.5 py-1 rounded-md border border-slate-700/80"
+                            title="Copy Command to Clipboard"
+                          >
+                            {copiedCommandId === job.id ? (
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5" />
+                            )}
+                            <span>{copiedCommandId === job.id ? 'Copied' : 'Copy Command'}</span>
+                          </button>
+                        </div>
+                        <div className="relative">
+                          <pre className="bg-slate-900 border border-slate-800 rounded-lg p-3 text-cyan-300 font-mono text-xs overflow-x-auto whitespace-pre-wrap break-all leading-relaxed max-h-36 overflow-y-auto selection:bg-cyan-500 selection:text-slate-950">
+                            {job.commandExecuted}
+                          </pre>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Task Metadata & Timing Details */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-slate-500 bg-slate-950/60 px-3.5 py-2.5 rounded-xl border border-slate-800/60">
+                      <span>
+                        Task ID: <strong className="text-slate-300 font-semibold">{job.id}</strong>
+                      </span>
+                      <span>
+                        Status: <strong className="text-slate-300 font-semibold uppercase">{job.status}</strong>
+                      </span>
+                      <span>
+                        Created: <strong className="text-slate-300 font-semibold">{job.createdAt}</strong>
+                      </span>
+                      <span>
+                        Elapsed: <strong className="text-slate-300 font-semibold">{formatSeconds(job.elapsedSeconds)}</strong>
+                      </span>
+                      <span>
+                        Segments: <strong className="text-slate-300 font-semibold">{job.currentSegment} / {job.totalSegments}</strong>
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })}

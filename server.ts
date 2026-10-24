@@ -276,43 +276,86 @@ async function startServer() {
       const targetUrl = url.trim();
       const { headerObj, headerFlags } = parseHeadersInput(rawHeaders);
 
-      // Probe stream in background / fast CLI probe if binary available
+      // Fetch and discover tracks from manifest using HTTP headers or CLI probe
+      const reqHeaders: Record<string, string> = {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: '*/*',
+        ...headerObj,
+      };
+
       let discoveredLangs: { audio: string[]; sub: string[] } = { audio: [], sub: [] };
-      if (HAS_NM3U8DL) {
+
+      // 1. Direct HTTP Manifest Fetch & Parse (instant and detects all subtitle/audio tracks)
+      try {
+        if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
+          const resp = await fetch(targetUrl, { headers: reqHeaders, redirect: 'follow' });
+          if (resp.ok) {
+            const manifestText = await resp.text();
+            const analysis = parseStreamManifest(manifestText, resp.url || targetUrl, outputName);
+            if (analysis) {
+              if (analysis.audioTracks.length > 0) {
+                discoveredLangs.audio = Array.from(
+                  new Set(analysis.audioTracks.flatMap((a) => [a.language, a.name]).filter(Boolean))
+                );
+              }
+              if (analysis.subtitleTracks.length > 0) {
+                discoveredLangs.sub = Array.from(
+                  new Set(analysis.subtitleTracks.flatMap((s) => [s.language, s.name]).filter(Boolean))
+                );
+              }
+            }
+          }
+        }
+      } catch (fetchErr: any) {
+        console.warn('[Tasks API Manifest Fetch Warning]', fetchErr.message);
+      }
+
+      // 2. Fallback CLI Probe if no tracks found
+      if (discoveredLangs.sub.length === 0 && HAS_NM3U8DL) {
         try {
           const cliTracks = await probeViaNm3u8dlCLI(targetUrl, headerObj);
           if (cliTracks) {
-            discoveredLangs.audio = Array.from(
-              new Set(cliTracks.audioTracks.map((a) => a.language).filter(Boolean))
-            );
-            discoveredLangs.sub = Array.from(
-              new Set(cliTracks.subtitleTracks.map((s) => s.language).filter(Boolean))
-            );
+            if (cliTracks.audioTracks.length > 0) {
+              discoveredLangs.audio = Array.from(
+                new Set([...discoveredLangs.audio, ...cliTracks.audioTracks.flatMap((a) => [a.language, a.name]).filter(Boolean)])
+              );
+            }
+            if (cliTracks.subtitleTracks.length > 0) {
+              discoveredLangs.sub = Array.from(
+                new Set([...discoveredLangs.sub, ...cliTracks.subtitleTracks.flatMap((s) => [s.language, s.name]).filter(Boolean)])
+              );
+            }
           }
         } catch (probeErr) {
           console.warn('[Tasks API Probe Warning]', probeErr);
         }
       }
 
-      // Check discovered subtitle languages: IF both eng and ita are present download both, otherwise none
+      // Check discovered subtitle languages: matches 2-letter (en, it), 3-letter (eng, ita), or language names (english, italian)
       const subLangs = discoveredLangs.sub.map((s) => s.toLowerCase());
-      const hasEngSub = subLangs.some((s) => s.includes('eng'));
-      const hasItaSub = subLangs.some((s) => s.includes('ita'));
-      let subFlag = ''
-      if (hasEngSub ) {
+      const hasEngSub = subLangs.some(
+        (s) => s === 'en' || s.includes('eng') || s.includes('english')
+      );
+      const hasItaSub = subLangs.some(
+        (s) => s === 'it' || s.includes('ita') || s.includes('italian')
+      );
+
+      let subFlag = '';
+      if (hasEngSub) {
         if (hasItaSub) {
-          subFlag = '--select-subtitle "lang=eng|ita"'
+          subFlag = '--select-subtitle "lang=eng|ita"';
         } else {
-          subFlag = '--select-subtitle "lang=eng"'
+          subFlag = '--select-subtitle "lang=eng"';
         }
       } else {
         if (hasItaSub) {
-          subFlag = '--select-subtitle "lang=ita"'
+          subFlag = '--select-subtitle "lang=ita"';
         } else {
-          subFlag = ''
+          subFlag = '';
         }
       }
-      const subSummary = (hasEngSub && hasItaSub) ? ['eng', 'ita'] : ['None'];
+      const subSummary = (hasEngSub && hasItaSub) ? ['eng', 'ita'] : hasEngSub ? ['eng'] : hasItaSub ? ['ita'] : ['None'];
 
       // Format safe output filename and save name
       const cleanBase = outputName.replace(/[/\\?%*:|"<>']/g, '_').trim() || 'Stream';
@@ -684,11 +727,15 @@ function probeViaNm3u8dlCLI(
       const audioTracks: AudioTrack[] = [];
       const subtitleTracks: SubtitleTrack[] = [];
 
-      const lines = stdout.split(/\r?\n/);
+      const stripAnsi = (str: string) => str.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+      const lines = stripAnsi(stdout).split(/\r?\n/);
       for (const line of lines) {
-        if (line.includes('Resolution:') || line.includes('Video')) {
-          const resM = line.match(/Resolution:\s*(\d+x\d+)/i) || line.match(/(\d+x\d+)/);
-          const bwM = line.match(/Bandwidth:\s*(\d+)/i) || line.match(/(\d+)\s*bps/i);
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.includes('Resolution:') || trimmed.startsWith('Vid') || trimmed.includes('Video')) {
+          const resM = trimmed.match(/Resolution:\s*(\d+x\d+)/i) || trimmed.match(/(\d+x\d+)/);
+          const bwM = trimmed.match(/Bandwidth:\s*(\d+)/i) || trimmed.match(/(\d+)\s*bps/i) || trimmed.match(/(\d+)\s*Kbps/i);
           if (resM) {
             const res = resM[1];
             const bw = bwM ? parseInt(bwM[1], 10) : 4000000;
@@ -703,36 +750,41 @@ function probeViaNm3u8dlCLI(
               hdr: 'SDR',
             });
           }
-        } else if (line.includes('Audio') || line.includes('Language:')) {
-          const langM = line.match(/Language:\s*([a-zA-Z-]+)/i) || line.match(/lang="([^"]+)"/i);
-          const nameM = line.match(/Name:\s*([^\s,]+)/i);
-          if (langM) {
-            const lang = langM[1].toLowerCase();
-            audioTracks.push({
-              id: `cli_a_${audioTracks.length + 1}_${lang}`,
-              language: lang,
-              languageName: lang.toUpperCase(),
-              name: nameM ? nameM[1] : `Audio (${lang.toUpperCase()})`,
-              channels: '2.0 Stereo',
-              codec: 'aac',
-              bitrate: 192000,
-              bitrateFormatted: '192 kbps',
-              groupId: 'cli_audio',
-            });
-          }
-        } else if (line.includes('Subtitle')) {
-          const langM = line.match(/Language:\s*([a-zA-Z-]+)/i) || line.match(/lang="([^"]+)"/i);
-          if (langM) {
-            const lang = langM[1].toLowerCase();
-            subtitleTracks.push({
-              id: `cli_s_${subtitleTracks.length + 1}_${lang}`,
-              language: lang,
-              languageName: lang.toUpperCase(),
-              name: `Subtitle (${lang.toUpperCase()})`,
-              format: 'vtt',
-              groupId: 'cli_subs',
-            });
-          }
+        } else if (trimmed.startsWith('Aud') || trimmed.includes('Audio') || trimmed.includes('Language:')) {
+          const langM =
+            trimmed.match(/Language:\s*([a-zA-Z-]+)/i) ||
+            trimmed.match(/lang="([^"]+)"/i) ||
+            trimmed.match(/Aud\*?\s+([a-zA-Z-]+)\s*\|/i) ||
+            trimmed.match(/\|\s*([a-zA-Z]{2,4})\b/i);
+          const nameM = trimmed.match(/Name:\s*([^\s,]+)/i) || trimmed.match(/Aud\*?\s+([^\s|]+)\s*\|/i) || trimmed.match(/\|\s*([^\n━]+)/);
+          const lang = (langM ? langM[1] : (trimmed.toLowerCase().includes('ita') ? 'ita' : trimmed.toLowerCase().includes('eng') ? 'eng' : 'und')).toLowerCase();
+          audioTracks.push({
+            id: `cli_a_${audioTracks.length + 1}_${lang}`,
+            language: lang,
+            languageName: lang.toUpperCase(),
+            name: nameM ? nameM[1].trim() : `Audio (${lang.toUpperCase()})`,
+            channels: '2.0 Stereo',
+            codec: 'aac',
+            bitrate: 192000,
+            bitrateFormatted: '192 kbps',
+            groupId: 'cli_audio',
+          });
+        } else if (trimmed.startsWith('Sub') || trimmed.includes('Subtitle')) {
+          const langM =
+            trimmed.match(/Language:\s*([a-zA-Z-]+)/i) ||
+            trimmed.match(/lang="([^"]+)"/i) ||
+            trimmed.match(/Sub\*?\s+([a-zA-Z-]+)\s*\|/i) ||
+            trimmed.match(/\|\s*([a-zA-Z]{2,4})\b/i);
+          const nameM = trimmed.match(/\|\s*([^\n━]+)/);
+          const lang = (langM ? langM[1] : (trimmed.toLowerCase().includes('ita') ? 'ita' : trimmed.toLowerCase().includes('eng') ? 'eng' : 'und')).toLowerCase();
+          subtitleTracks.push({
+            id: `cli_s_${subtitleTracks.length + 1}_${lang}`,
+            language: lang,
+            languageName: lang.toUpperCase(),
+            name: nameM ? nameM[1].trim() : `Subtitle (${lang.toUpperCase()})`,
+            format: 'vtt',
+            groupId: 'cli_subs',
+          });
         }
       }
 
