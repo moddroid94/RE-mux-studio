@@ -233,6 +233,15 @@ async function startServer() {
     }
   });
 
+  //EXTENSION COMPATIBILITY LAYER
+  //fake login ok response
+  app.post('/api/auth/login', (req: Request, res: Request) => {
+    return res.json({
+      id: 1,
+      username: req.body.username,
+    });
+  });
+  
   // API Route: Automated Task Probe & Start Download Endpoint
   app.post('/api/tasks', async (req: Request, res: Response) => {
     try {
