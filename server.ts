@@ -568,8 +568,8 @@ class TerminalScreenBuffer {
       i++;
     }
 
-    if (this.lines.length > 50) {
-      const dropCount = this.lines.length - 50;
+    if (this.lines.length > 100) {
+      const dropCount = this.lines.length - 100;
       this.lines.splice(0, dropCount);
       this.cursorY = Math.max(0, this.cursorY - dropCount);
     }
@@ -581,6 +581,7 @@ class TerminalScreenBuffer {
         l
           .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
           .replace(/[\x00-\x1F\x7F]/g, '')
+          .replace(/\s+/g, ' ')
           .trim()
       )
       .filter(Boolean);
@@ -679,8 +680,6 @@ function runDownloadProcess(
         env: {
           ...process.env,
           TERM: 'xterm-256color',
-          COLUMNS: '240',
-          LINES: '60',
         },
       });
       item.process = child;

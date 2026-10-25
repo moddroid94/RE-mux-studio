@@ -305,7 +305,7 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
                     </span>
                   </div>
 
-                  <div className="space-y-1 text-xs">
+                  <div className="space-y-1 text-xs max-h-96 overflow-y-auto pr-1">
                     {(job.terminalLines && job.terminalLines.length > 0
                       ? job.terminalLines
                       : [job.lastTerminalLine || (job.status === 'completed' ? `Output: /downloads/${job.outputFile}` : 'Executing stream download...')]
