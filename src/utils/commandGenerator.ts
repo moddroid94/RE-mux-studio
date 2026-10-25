@@ -91,6 +91,48 @@ export function sanitizeSaveName(title?: string): string {
 }
 
 /**
+ * Helper to extract clean language codes (e.g. "eng", "ita", "en", "it") from selected track IDs or analysis.
+ * Ensures internal synthetic IDs (like "sub-subs-eng-1") are never passed to the CLI.
+ */
+export function extractLanguageCodes(
+  selectedIds: string[],
+  tracks: Array<{ id: string; language?: string; name?: string; languageName?: string }>
+): string[] {
+  const langs = new Set<string>();
+
+  selectedIds.forEach((id) => {
+    if (!id) return;
+
+    // 1. Look up track in analysis
+    const track = tracks.find(
+      (t) =>
+        t.id === id ||
+        (t.language && t.language.toLowerCase() === id.toLowerCase())
+    );
+
+    if (track && track.language && track.language.trim()) {
+      langs.add(track.language.trim().toLowerCase());
+    } else if (
+      !id.startsWith('sub-') &&
+      !id.startsWith('dash_s_') &&
+      !id.startsWith('aud-') &&
+      !id.startsWith('dash_a_')
+    ) {
+      // 2. Direct language code passed (e.g. "eng", "ita", "en", "it", "es")
+      langs.add(id.trim().toLowerCase());
+    } else {
+      // 3. Synthetic ID like "sub-subs-eng-1" -> parse language code "eng" from ID string
+      const match = id.match(/(?:sub|dash_s|aud|dash_a)[-_](?:[^-_\s]+[-_])?([a-zA-Z]{2,3})(?:[-_]|$)/i);
+      if (match && match[1]) {
+        langs.add(match[1].toLowerCase());
+      }
+    }
+  });
+
+  return Array.from(langs).filter(Boolean);
+}
+
+/**
  * Generates an N_m3u8DL-RE CLI command from analysis, selections, and config.
  */
 export function generateNm3u8dlCommand(
@@ -161,14 +203,12 @@ export function generateNm3u8dlCommand(
   if (selections.autoAllAudio) {
     parts.push(`-sa all`);
   } else if (selections.selectedAudioIds.length > 0) {
-    const selectedAudios = analysis.audioTracks.filter((a) =>
-      selections.selectedAudioIds.includes(a.id)
+    const audioLangs = extractLanguageCodes(
+      selections.selectedAudioIds,
+      analysis.audioTracks
     );
-    const langs = Array.from(
-      new Set(selectedAudios.map((a) => a.language).filter(Boolean))
-    );
-    if (langs.length > 0) {
-      parts.push(`--select-audio "lang=${langs.join('|')}"`);
+    if (audioLangs.length > 0) {
+      parts.push(`--select-audio "for=all:lang=${audioLangs.join('|')}"`);
     } else {
       parts.push(`-sa all`);
     }
@@ -180,14 +220,14 @@ export function generateNm3u8dlCommand(
   if (selections.autoAllSubtitles) {
     parts.push(`-ss all`);
   } else if (selections.selectedSubtitleIds.length > 0) {
-    const selectedSubs = analysis.subtitleTracks.filter((s) =>
-      selections.selectedSubtitleIds.includes(s.id)
+    const subLangs = extractLanguageCodes(
+      selections.selectedSubtitleIds,
+      analysis.subtitleTracks
     );
-    const langs = Array.from(
-      new Set(selectedSubs.map((s) => s.language).filter(Boolean))
-    );
-    if (langs.length > 0) {
-      parts.push(`--select-subtitle "lang=${langs.join('|')}"`);
+    if (subLangs.length > 0) {
+      parts.push(`-ss "for=all:lang=${subLangs.join('|')}"`);
+    } else {
+      parts.push(`-ss all`);
     }
   }
 
@@ -294,6 +334,7 @@ export function buildDownloadJobPlan(params: {
   config?: Partial<CommandConfig>;
   headers?: any;
   explicitCommand?: string;
+  commandExecuted?: string;
   explicitSelectionsSummary?: { video: string; audio: string[]; subtitles: string[] };
 }): DownloadJobPlan {
   const url = params.url.trim();
@@ -327,33 +368,13 @@ export function buildDownloadJobPlan(params: {
     subtitleTracks: [],
   };
 
-  // Subtitle auto-selection logic: if manifest has subtitles and no explicit subtitle list provided,
-  // select both English and Italian if both exist, or the single present one, or none.
-  if (
-    (!params.selections || !params.selections.selectedSubtitleIds || params.selections.selectedSubtitleIds.length === 0) &&
-    analysis.subtitleTracks.length > 0
-  ) {
-    const subLangs = analysis.subtitleTracks.map((s) => (s.language || s.name || '').toLowerCase());
-    const hasEng = subLangs.some((s) => s === 'en' || s.includes('eng') || s.includes('english'));
-    const hasIta = subLangs.some((s) => s === 'it' || s.includes('ita') || s.includes('italian'));
+  // Generate or preserve explicit command string without reprocessing
+  const explicitCmd =
+    params.explicitCommand ||
+    params.commandExecuted ||
+    (params as any).commandExecuted;
 
-    if (hasEng || hasIta) {
-      selections.autoAllSubtitles = false;
-      const matchedSubs = analysis.subtitleTracks.filter((s) => {
-        const l = (s.language || s.name || '').toLowerCase();
-        const isE = l === 'en' || l.includes('eng') || l.includes('english');
-        const isI = l === 'it' || l.includes('ita') || l.includes('italian');
-        return (hasEng && isE) || (hasIta && isI);
-      });
-      selections.selectedSubtitleIds = matchedSubs.map((s) => s.id);
-    } else {
-      selections.autoAllSubtitles = false;
-      selections.selectedSubtitleIds = [];
-    }
-  }
-
-  // Generate command string if not explicitly passed
-  const commandExecuted = params.explicitCommand || generateNm3u8dlCommand(analysis, selections, config);
+  const commandExecuted = explicitCmd || generateNm3u8dlCommand(analysis, selections, config);
 
   // Compute selections summary
   let selectionsSummary = params.explicitSelectionsSummary;

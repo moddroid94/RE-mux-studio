@@ -181,28 +181,36 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
 
   const toggleAudioTrack = (trackId: string) => {
     setSelections((prev) => {
-      const exists = prev.selectedAudioIds.includes(trackId);
+      const currentList = prev.autoAllAudio
+        ? (analysis?.audioTracks.map((a) => a.id) || [])
+        : prev.selectedAudioIds;
+      const exists = currentList.includes(trackId);
       const updated = exists
-        ? prev.selectedAudioIds.filter((id) => id !== trackId)
-        : [...prev.selectedAudioIds, trackId];
+        ? currentList.filter((id) => id !== trackId)
+        : [...currentList, trackId];
+      const isAll = Boolean(analysis?.audioTracks && updated.length === analysis.audioTracks.length);
       return {
         ...prev,
         selectedAudioIds: updated,
-        autoAllAudio: updated.length === analysis?.audioTracks.length,
+        autoAllAudio: isAll,
       };
     });
   };
 
   const toggleSubtitleTrack = (trackId: string) => {
     setSelections((prev) => {
-      const exists = prev.selectedSubtitleIds.includes(trackId);
+      const currentList = prev.autoAllSubtitles
+        ? (analysis?.subtitleTracks.map((s) => s.id) || [])
+        : prev.selectedSubtitleIds;
+      const exists = currentList.includes(trackId);
       const updated = exists
-        ? prev.selectedSubtitleIds.filter((id) => id !== trackId)
-        : [...prev.selectedSubtitleIds, trackId];
+        ? currentList.filter((id) => id !== trackId)
+        : [...currentList, trackId];
+      const isAll = Boolean(analysis?.subtitleTracks && updated.length === analysis.subtitleTracks.length);
       return {
         ...prev,
         selectedSubtitleIds: updated,
-        autoAllSubtitles: updated.length === analysis?.subtitleTracks.length,
+        autoAllSubtitles: isAll,
       };
     });
   };
@@ -853,26 +861,52 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
 
           {/* Subtitle Streams Multi-Select Matrix */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <h4 className="text-sm font-bold text-white flex items-center gap-2">
                 <Subtitles className="w-4 h-4 text-purple-400" />
                 Subtitle Stream Selection Matrix
               </h4>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selections.autoAllSubtitles}
+                    onChange={(e) =>
+                      setSelections((prev) => ({
+                        ...prev,
+                        autoAllSubtitles: e.target.checked,
+                        selectedSubtitleIds: e.target.checked
+                          ? analysis.subtitleTracks.map((s) => s.id)
+                          : [],
+                      }))
+                    }
+                    className="rounded border-slate-700 bg-slate-950 text-purple-500 focus:ring-purple-500"
+                  />
+                  <span className="font-semibold text-purple-300">
+                    All Subtitles (-ss all)
+                  </span>
+                </label>
                 <span className="text-xs text-purple-400 font-mono font-semibold">
-                  {selections.selectedSubtitleIds.length} of{' '}
-                  {analysis.subtitleTracks.length} Subtitles Selected
+                  {selections.autoAllSubtitles
+                    ? `${analysis.subtitleTracks.length} of ${analysis.subtitleTracks.length}`
+                    : `${selections.selectedSubtitleIds.length} of ${analysis.subtitleTracks.length}`}{' '}
+                  Subtitles Selected
                 </span>
                 <button
                   onClick={() =>
-                    setSelections((prev) => ({
-                      ...prev,
-                      selectedSubtitleIds:
+                    setSelections((prev) => {
+                      const allSelected =
+                        prev.autoAllSubtitles ||
                         prev.selectedSubtitleIds.length ===
-                        analysis.subtitleTracks.length
+                          analysis.subtitleTracks.length;
+                      return {
+                        ...prev,
+                        selectedSubtitleIds: allSelected
                           ? []
                           : analysis.subtitleTracks.map((s) => s.id),
-                    }))
+                        autoAllSubtitles: !allSelected,
+                      };
+                    })
                   }
                   className="px-2.5 py-1 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition-colors"
                 >
@@ -900,8 +934,10 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 bg-slate-900/50">
                     {analysis.subtitleTracks.map((s) => {
-                      const isSelected =
-                        selections.selectedSubtitleIds.includes(s.id);
+                      const isSelected = Boolean(
+                        selections.autoAllSubtitles ||
+                          selections.selectedSubtitleIds.includes(s.id)
+                      );
                       return (
                         <tr
                           key={s.id}
