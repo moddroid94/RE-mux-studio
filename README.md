@@ -9,6 +9,12 @@ Stream Downloader & Muxer Web Interface for **N_m3u8DL-RE** and **FFmpeg**.
 - **Built-in HLS Live Player**: Preview streams before downloading, with quality level switching, audio track testing, subtitle overlay toggles, and real-time buffer telemetry.
 - **Real-Time Task Queue & Terminal Output**: Automatic progress tracking with segment counters (`450/1200`), download speed indicators, ETA calculations, and terminal logs.
 - **Dockerized Ready**: Pre-packaged with Node.js, `FFmpeg`, and `N_m3u8DL-RE` Linux binary.
+- **m3u8DL-Sniffer**: compatible with already made m3u8DL-sniffer chrome extension https://github.com/panoptes88/m3u8dl-browser-extension
+
+## Extension Setup
+
+Install the extension, setup the url to point re-mux studio, fill user and pass with any character, they're not really used.
+Use it.
 
 ## Quick Start with Docker
 
