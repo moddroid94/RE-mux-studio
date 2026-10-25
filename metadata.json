@@ -1,6 +1,0 @@
-{
-  "name": "RE-Mux Studio",
-  "description": "Stream Downloader & Muxer GUI for N_m3u8DL-RE and FFmpeg with stream analyzer, multi-track selection, live HLS preview, and automatic progress tracking.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
