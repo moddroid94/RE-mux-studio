@@ -466,6 +466,129 @@ function locateAndRelocateOutputFile(targetFilename: string): { filename: string
   return { filename: targetFilename, bytes: 0 };
 }
 
+class TerminalScreenBuffer {
+  private lines: string[] = [''];
+  private cursorY = 0;
+  private cursorX = 0;
+
+  write(text: string) {
+    let i = 0;
+    while (i < text.length) {
+      const ch = text[i];
+
+      // Handle ANSI Escape sequences
+      if (ch === '\x1b') {
+        if (text[i + 1] === '[') {
+          let j = i + 2;
+          while (
+            j < text.length &&
+            ((text.charCodeAt(j) >= 0x30 && text.charCodeAt(j) <= 0x3f) ||
+              (text.charCodeAt(j) >= 0x20 && text.charCodeAt(j) <= 0x2f))
+          ) {
+            j++;
+          }
+          if (j < text.length) {
+            const finalChar = text[j];
+            const paramStr = text.substring(i + 2, j);
+            const num = parseInt(paramStr, 10) || 1;
+
+            if (finalChar === 'A') {
+              this.cursorY = Math.max(0, this.cursorY - num);
+            } else if (finalChar === 'B') {
+              this.cursorY += num;
+              while (this.lines.length <= this.cursorY) {
+                this.lines.push('');
+              }
+            } else if (finalChar === 'C') {
+              this.cursorX += num;
+            } else if (finalChar === 'D') {
+              this.cursorX = Math.max(0, this.cursorX - num);
+            } else if (finalChar === 'E') {
+              this.cursorY += num;
+              this.cursorX = 0;
+              while (this.lines.length <= this.cursorY) {
+                this.lines.push('');
+              }
+            } else if (finalChar === 'F') {
+              this.cursorY = Math.max(0, this.cursorY - num);
+              this.cursorX = 0;
+            } else if (finalChar === 'G') {
+              this.cursorX = Math.max(0, (parseInt(paramStr, 10) || 1) - 1);
+            } else if (finalChar === 'H' || finalChar === 'f') {
+              const parts = paramStr.split(';');
+              const col = parts[1] ? parseInt(parts[1], 10) || 1 : 1;
+              this.cursorX = Math.max(0, col - 1);
+            } else if (finalChar === 'K') {
+              const cur = this.lines[this.cursorY] || '';
+              if (paramStr === '2') {
+                this.lines[this.cursorY] = '';
+                this.cursorX = 0;
+              } else if (paramStr === '1') {
+                this.lines[this.cursorY] = ' '.repeat(this.cursorX) + cur.substring(this.cursorX);
+              } else {
+                this.lines[this.cursorY] = cur.substring(0, this.cursorX);
+              }
+            }
+            i = j + 1;
+            continue;
+          }
+        }
+        i++;
+        continue;
+      }
+
+      if (ch === '\r') {
+        this.cursorX = 0;
+        i++;
+        continue;
+      }
+
+      if (ch === '\n') {
+        this.cursorY++;
+        this.cursorX = 0;
+        while (this.lines.length <= this.cursorY) {
+          this.lines.push('');
+        }
+        i++;
+        continue;
+      }
+
+      while (this.lines.length <= this.cursorY) {
+        this.lines.push('');
+      }
+      const curLine = this.lines[this.cursorY];
+      if (this.cursorX < curLine.length) {
+        this.lines[this.cursorY] =
+          curLine.substring(0, this.cursorX) + ch + curLine.substring(this.cursorX + 1);
+      } else {
+        const padding = ' '.repeat(this.cursorX - curLine.length);
+        this.lines[this.cursorY] = curLine + padding + ch;
+      }
+      this.cursorX++;
+      i++;
+    }
+
+    if (this.lines.length > 50) {
+      const dropCount = this.lines.length - 50;
+      this.lines.splice(0, dropCount);
+      this.cursorY = Math.max(0, this.cursorY - dropCount);
+    }
+  }
+
+  getActiveLines(): string[] {
+    const cleaned = this.lines
+      .map((l) =>
+        l
+          .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
+          .replace(/[\x00-\x1F\x7F]/g, '')
+          .trim()
+      )
+      .filter(Boolean);
+    if (cleaned.length === 0) return [];
+    return cleaned.slice(-6);
+  }
+}
+
 /* =========================================================================
    TASK PROCESS EXECUTION ENGINE
    ========================================================================= */
@@ -478,6 +601,8 @@ function createAndStartJob(plan: DownloadJobPlan): DownloadJob {
     title: plan.title,
     status: 'parsing',
     progress: 0,
+    lastTerminalLine: 'Starting N_m3u8DL-RE download process...',
+    terminalLines: ['Starting N_m3u8DL-RE download process...'],
     currentSegment: 0,
     totalSegments: 100,
     currentSpeedBps: 0,
@@ -563,67 +688,22 @@ function runDownloadProcess(
 
       job.status = 'downloading_video';
 
-      let stdoutBuffer = '';
-      let stderrBuffer = '';
-      let lastProgressLogTime = 0;
-      const trackMap = new Map<string, { current: number; total: number; speedBps: number }>();
+      const termBuffer = new TerminalScreenBuffer();
+      const loggedMilestones = new Set<string>();
       const startTimestamp = Date.now();
 
-      const parseBytes = (valStr: string, unitStr?: string): number => {
-        const val = parseFloat(valStr);
-        if (isNaN(val)) return 0;
-        const unit = (unitStr || '').toUpperCase();
-        if (unit.startsWith('G')) return Math.round(val * 1024 * 1024 * 1024);
-        if (unit.startsWith('M')) return Math.round(val * 1024 * 1024);
-        if (unit.startsWith('K')) return Math.round(val * 1024);
-        return Math.round(val);
-      };
-
-      // Paced timer: ticks once per second to calculate elapsed time, update stats, and emit SSE
-      const timer = setInterval(() => {
-        if (job.status === 'completed' || job.status === 'failed') {
-          clearInterval(timer);
-          return;
-        }
-        job.elapsedSeconds = Math.max(1, Math.floor((Date.now() - startTimestamp) / 1000));
-
-        if (job.currentSpeedBps > 0 && job.status.includes('downloading')) {
-          if (job.downloadedBytes === 0) {
-            job.downloadedBytes += job.currentSpeedBps;
-          }
-          if (job.progress > 0 && (job.totalBytes <= 0 || job.totalBytes < job.downloadedBytes)) {
-            job.totalBytes = Math.round(job.downloadedBytes / (job.progress / 100));
-          }
-        }
-
-        notifyJobProgress(job);
-      }, 1000);
-
-      const stripAnsi = (str: string) => str.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
-
-      const handleLine = (line: string) => {
-        const cleanLine = stripAnsi(line).trim();
-        if (!cleanLine) return;
-
-        const isProgressBarLine = cleanLine.includes('━') || /^(Vid|Aud|Sub)\*?\s/i.test(cleanLine);
-        if (!isProgressBarLine) {
-          addLog(job, cleanLine.toLowerCase().includes('mux') ? 'muxer' : 'info', cleanLine);
-        } else if (Date.now() - lastProgressLogTime > 3000) {
-          lastProgressLogTime = Date.now();
-          addLog(job, 'info', cleanLine);
-        }
-
-        if (cleanLine.includes('Downloading video') || cleanLine.startsWith('Vid') || cleanLine.includes('Vid*')) {
+      const checkStatusAndSaveName = (line: string) => {
+        if (line.includes('Downloading video') || line.startsWith('Vid') || line.includes('Vid*')) {
           job.status = 'downloading_video';
-        } else if (cleanLine.includes('Downloading audio') || cleanLine.startsWith('Aud') || cleanLine.includes('Aud*')) {
+        } else if (line.includes('Downloading audio') || line.startsWith('Aud') || line.includes('Aud*')) {
           job.status = 'downloading_audio';
-        } else if (cleanLine.includes('Downloading subtitle') || cleanLine.startsWith('Sub') || cleanLine.includes('Sub*')) {
+        } else if (line.includes('Downloading subtitle') || line.startsWith('Sub') || line.includes('Sub*')) {
           job.status = 'downloading_subtitles';
-        } else if (cleanLine.includes('Muxing') || cleanLine.includes('FFmpeg') || cleanLine.includes('MuxAfterDone') || cleanLine.includes('Merging')) {
+        } else if (line.includes('Muxing') || line.includes('FFmpeg') || line.includes('MuxAfterDone') || line.includes('Merging')) {
           job.status = 'muxing';
         }
 
-        const saveNameLogMatch = cleanLine.match(/Save Name:\s*(.+)/i);
+        const saveNameLogMatch = line.match(/Save Name:\s*(.+)/i);
         if (saveNameLogMatch) {
           const parsedSaveName = saveNameLogMatch[1].trim();
           if (parsedSaveName) {
@@ -631,100 +711,62 @@ function runDownloadProcess(
             job.outputFile = `${parsedSaveName}.${currentExt}`;
           }
         }
+      };
 
-        const segMatch = cleanLine.match(/(\d+)\s*\/\s*(\d+)/);
-        const searchTarget = segMatch && segMatch.index !== undefined
-          ? cleanLine.substring(segMatch.index)
-          : cleanLine;
+      const recordMilestone = (line: string) => {
+        const isMilestone =
+          line.includes('INFO') ||
+          line.includes('WARN') ||
+          line.includes('ERROR') ||
+          line.includes('Save Name:') ||
+          line.includes('Selected') ||
+          line.includes('Muxing') ||
+          line.includes('FFmpeg') ||
+          line.includes('Merging') ||
+          line.includes('Download complete');
 
-        // Size parsing
-        const sizeMatch = searchTarget.match(/([\d.]+)\s*(GB|GiB|MB|MiB|KB|KiB|B)\s*\/\s*([\d.]+)\s*(GB|GiB|MB|MiB|KB|KiB|B)?/i);
-        if (sizeMatch) {
-          const dlBytes = parseBytes(sizeMatch[1], sizeMatch[2]);
-          if (dlBytes > 0) job.downloadedBytes = dlBytes;
-
-          let totBytes = 0;
-          if (sizeMatch[4]) {
-            totBytes = parseBytes(sizeMatch[3], sizeMatch[4]);
-          } else {
-            const dlVal = parseFloat(sizeMatch[1]);
-            const totVal = parseFloat(sizeMatch[3]);
-            if (!isNaN(totVal)) {
-              totBytes = parseBytes(sizeMatch[3], totVal >= dlVal ? sizeMatch[2] : 'GB');
-            }
-          }
-          if (totBytes >= dlBytes) job.totalBytes = totBytes;
+        if (isMilestone && !loggedMilestones.has(line)) {
+          loggedMilestones.add(line);
+          const lvl = line.toLowerCase().includes('mux') ? 'muxer' : line.includes('ERROR') ? 'error' : 'info';
+          addLog(job, lvl, line);
         }
+      };
 
-        // Speed parsing
-        const speedMatch = searchTarget.match(/([\d.]+)\s*(GBps|GiBps|MBps|MiBps|KBps|KiBps|Bps|GB\/s|GiB\/s|MB\/s|MiB\/s|KB\/s|KiB\/s|B\/s|M\/s|K\/s|Gbps|Mbps|Kbps)/i);
-        if (speedMatch) {
-          const val = parseFloat(speedMatch[1]);
-          const unit = speedMatch[2].toUpperCase();
-          let bps = val;
-          if (unit.startsWith('G')) bps = val * 1024 * 1024 * 1024;
-          else if (unit.startsWith('M')) bps = val * 1024 * 1024;
-          else if (unit.startsWith('K')) bps = val * 1024;
-
-          if (bps > 0) {
-            job.currentSpeedBps = Math.round(bps);
-            job.speedHistory.push(job.currentSpeedBps);
-            if (job.speedHistory.length > 20) job.speedHistory.shift();
-          }
-        }
-
-        // ETA parsing
-        const etaMatch = searchTarget.match(/\b(\d{2}):(\d{2}):(\d{2})\b/);
-        if (etaMatch) {
-          job.etaSeconds = parseInt(etaMatch[1], 10) * 3600 + parseInt(etaMatch[2], 10) * 60 + parseInt(etaMatch[3], 10);
-        }
-
-        // Segment & progress tracking
-        const trackMatch = cleanLine.match(/^(Vid|Aud|Sub)\*?\s*([^|]+)/i) || cleanLine.match(/(Vid|Aud|Sub)\*?\s*([\w\-]+)/i);
-        if (trackMatch && segMatch) {
-          const key = `${trackMatch[1].toUpperCase()}_${trackMatch[2].trim().replace(/[^a-zA-Z0-9_-]/g, '_')}`;
-          trackMap.set(key, { current: parseInt(segMatch[1], 10), total: parseInt(segMatch[2], 10), speedBps: job.currentSpeedBps });
-
-          let sumCurrent = 0;
-          let sumTotal = 0;
-          for (const t of trackMap.values()) {
-            sumCurrent += t.current;
-            sumTotal += t.total;
-          }
-          if (sumTotal > 0) {
-            job.currentSegment = sumCurrent;
-            job.totalSegments = sumTotal;
-            job.progress = Math.max(job.progress, Math.min(98, Math.round((sumCurrent / sumTotal) * 100)));
-          }
-        } else if (segMatch) {
-          const cur = parseInt(segMatch[1], 10);
-          const tot = parseInt(segMatch[2], 10);
-          job.currentSegment = Math.max(job.currentSegment, cur);
-          job.totalSegments = Math.max(job.totalSegments, tot);
-          if (tot > 0) {
-            job.progress = Math.max(job.progress, Math.min(98, Math.round((cur / tot) * 100)));
+      const processTerminalStream = (text: string) => {
+        termBuffer.write(text);
+        const activeLines = termBuffer.getActiveLines();
+        if (activeLines.length > 0) {
+          job.terminalLines = activeLines;
+          job.lastTerminalLine = activeLines[activeLines.length - 1];
+          for (const line of activeLines) {
+            checkStatusAndSaveName(line);
+            recordMilestone(line);
           }
         }
       };
 
+      // Paced timer: ticks once per second to calculate elapsed time and emit SSE
+      const timer = setInterval(() => {
+        if (job.status === 'completed' || job.status === 'failed') {
+          clearInterval(timer);
+          return;
+        }
+
+        job.elapsedSeconds = Math.max(1, Math.floor((Date.now() - startTimestamp) / 1000));
+        notifyJobProgress(job);
+      }, 1000);
+
       child.stdout?.on('data', (chunk: Buffer) => {
-        stdoutBuffer += chunk.toString('utf8');
-        const lines = stdoutBuffer.split(/\r\n|\r|\n/);
-        stdoutBuffer = lines.pop() || '';
-        for (const l of lines) handleLine(l);
+        processTerminalStream(chunk.toString('utf8'));
       });
 
       child.stderr?.on('data', (chunk: Buffer) => {
-        stderrBuffer += chunk.toString('utf8');
-        const lines = stderrBuffer.split(/\r\n|\r|\n/);
-        stderrBuffer = lines.pop() || '';
-        for (const l of lines) handleLine(l);
+        processTerminalStream(chunk.toString('utf8'));
       });
 
       child.on('close', (code) => {
         clearInterval(timer);
-        if (stdoutBuffer.trim()) handleLine(stdoutBuffer);
-        if (stderrBuffer.trim()) handleLine(stderrBuffer);
+        processTerminalStream('\n');
 
         const fileResult = locateAndRelocateOutputFile(job.outputFile);
         if (fileResult.bytes > 0) {
@@ -744,11 +786,16 @@ function runDownloadProcess(
           job.progress = 100;
           job.etaSeconds = 0;
           const sizeMb = (job.downloadedBytes / (1024 * 1024)).toFixed(1);
+          const successLine = `[SUCCESS] Output file: /downloads/${job.outputFile} (${sizeMb} MB)`;
+          job.lastTerminalLine = successLine;
+          job.terminalLines = [successLine];
           addLog(job, 'info', `[SUCCESS] Download completed! Output file: /downloads/${job.outputFile} (${sizeMb} MB)`);
           addLog(job, 'info', `[Permissions] Set world RW access & non-root ownership on /downloads/${job.outputFile}`);
         } else {
           job.status = 'failed';
           job.error = `Process exited with code ${code}`;
+          job.lastTerminalLine = `[ERROR] Process exited with code ${code}`;
+          job.terminalLines = [`[ERROR] Process exited with code ${code}`];
           addLog(job, 'error', `[ERROR] Process exited with code ${code}`);
         }
         notifyJobProgress(job, true);
@@ -757,6 +804,8 @@ function runDownloadProcess(
       child.on('error', (err) => {
         job.status = 'failed';
         job.error = err.message;
+        job.lastTerminalLine = `[ERROR] Execution failed: ${err.message}`;
+        job.terminalLines = [`[ERROR] Execution failed: ${err.message}`];
         addLog(job, 'error', `[ERROR] Binary execution failed: ${err.message}`);
         notifyJobProgress(job, true);
       });
@@ -771,52 +820,74 @@ function runDownloadProcess(
   // Web test/fallback runner (used when native N_m3u8DL-RE is absent)
   addLog(job, 'info', `[RE-Mux Pipeline] Running simulated web runner for task ${jobId}...`);
   let step = 0;
-  const totalSegs = 200;
-  job.totalSegments = totalSegs;
-  job.totalBytes = 250 * 1024 * 1024;
+  const simulatedSteps: string[][] = [
+    ['Parsing stream manifest...'],
+    ['Selected 1080p Video + English Audio (2.0) + English Subtitles'],
+    [
+      'Vid* 1920x1080 | 18.2% |  65MB | 14.5 MB/s | ETA 00:00:22',
+      'Aud* en-US     | 24.5% |   8MB |  2.1 MB/s | ETA 00:00:19',
+    ],
+    [
+      'Vid* 1920x1080 | 39.4% | 142MB | 16.8 MB/s | ETA 00:00:17',
+      'Aud* en-US     | 51.0% |  17MB |  2.4 MB/s | ETA 00:00:13',
+    ],
+    [
+      'Vid* 1920x1080 | 62.7% | 225MB | 17.5 MB/s | ETA 00:00:10',
+      'Aud* en-US     | 78.9% |  26MB |  2.3 MB/s | ETA 00:00:06',
+    ],
+    [
+      'Vid* 1920x1080 | 88.5% | 318MB | 18.2 MB/s | ETA 00:00:03',
+      'Aud* en-US     | 96.2% |  32MB |  2.2 MB/s | ETA 00:00:01',
+      'Sub* en-US     | 100.0% | 45KB |       -- | ETA 00:00:00',
+    ],
+    [
+      'Vid* 1920x1080 | 100.0% | 360MB | Download complete',
+      'Aud* en-US     | 100.0% |  34MB | Download complete',
+      'Sub* en-US     | 100.0% |  45KB | Download complete',
+    ],
+    [
+      'Muxing: [FFmpeg] Merging video, audio, and subtitles...',
+      'Writing container format to MP4...',
+    ],
+  ];
 
   item.intervalTimer = setInterval(() => {
     if (job.status === 'paused' || job.status === 'completed' || job.status === 'failed') return;
-    step++;
+    job.elapsedSeconds += 1;
 
-    if (job.status === 'parsing') {
-      job.status = 'downloading_video';
-      notifyJobProgress(job);
-      return;
-    }
-
-    if (job.status.includes('downloading')) {
-      job.currentSegment = Math.min(job.totalSegments, job.currentSegment + 20);
-      job.progress = Math.round((job.currentSegment / job.totalSegments) * 88);
-      job.currentSpeedBps = 25 * 1024 * 1024;
-      job.downloadedBytes = Math.round((job.currentSegment / job.totalSegments) * job.totalBytes);
-      job.elapsedSeconds += 1;
-      job.etaSeconds = Math.max(1, Math.round((job.totalBytes - job.downloadedBytes) / job.currentSpeedBps));
-
-      if (job.currentSegment >= job.totalSegments) {
+    if (step < simulatedSteps.length) {
+      const currentLines = simulatedSteps[step];
+      job.terminalLines = currentLines;
+      job.lastTerminalLine = currentLines[currentLines.length - 1];
+      if (currentLines[0]?.startsWith('Muxing')) {
         job.status = 'muxing';
-        job.progress = 92;
-        addLog(job, 'muxer', `[FFmpeg] Muxing segments into /downloads/${outputFilename}`);
+      } else {
+        job.status = 'downloading_video';
       }
+      step++;
       notifyJobProgress(job);
       return;
     }
 
-    if (job.status === 'muxing') {
-      job.progress = 100;
-      job.status = 'completed';
-      job.etaSeconds = 0;
-      const targetFile = path.join(DOWNLOADS_DIR, outputFilename);
-      if (!fs.existsSync(targetFile)) {
-        fs.writeFileSync(targetFile, `Stream downloaded result: ${job.title}\nJob ID: ${job.id}`);
-      }
-      adjustFilePermissionsAndOwnership(targetFile);
-      adjustFilePermissionsAndOwnership(DOWNLOADS_DIR);
-      addLog(job, 'info', `[SUCCESS] Remux completed cleanly: /downloads/${outputFilename}`);
-      addLog(job, 'info', `[Permissions] Set world RW access & non-root ownership on /downloads/${outputFilename}`);
-      if (item.intervalTimer) clearInterval(item.intervalTimer);
-      notifyJobProgress(job, true);
+    job.status = 'completed';
+    job.progress = 100;
+    const finalLine = `[SUCCESS] Output file: /downloads/${outputFilename}`;
+    job.lastTerminalLine = finalLine;
+    job.terminalLines = [finalLine];
+    const targetFile = path.join(DOWNLOADS_DIR, outputFilename);
+    if (!fs.existsSync(targetFile)) {
+      fs.writeFileSync(targetFile, `Stream downloaded result: ${job.title}\nJob ID: ${job.id}`);
     }
+    if (fs.existsSync(targetFile)) {
+      const sz = fs.statSync(targetFile).size;
+      job.downloadedBytes = sz;
+      job.totalBytes = sz;
+    }
+    adjustFilePermissionsAndOwnership(targetFile);
+    adjustFilePermissionsAndOwnership(DOWNLOADS_DIR);
+    addLog(job, 'info', finalLine);
+    if (item.intervalTimer) clearInterval(item.intervalTimer);
+    notifyJobProgress(job, true);
   }, 1000);
 }
 

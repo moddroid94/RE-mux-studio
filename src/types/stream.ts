@@ -114,7 +114,9 @@ export interface DownloadJob {
     | 'completed'
     | 'failed'
     | 'paused';
-  progress: number; // 0 to 100
+  progress: number;
+  lastTerminalLine?: string;
+  terminalLines?: string[];
   currentSegment: number;
   totalSegments: number;
   currentSpeedBps: number;

@@ -4,11 +4,9 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
-  Clock,
   Copy,
   Download,
   FileVideo,
-  Gauge,
   Layers,
   Link,
   Pause,
@@ -112,7 +110,7 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
               Download Task Runner & Queue
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Real-time segment completion tracking, speed telemetry, and FFmpeg remuxing pipeline.
+              Stream download queue, ETA progress tracking, and FFmpeg remuxing pipeline.
             </p>
           </div>
 
@@ -229,7 +227,7 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
                       )}
                       {job.status.includes('downloading') && (
                         <span className="px-2.5 py-0.5 text-[10px] font-bold uppercase bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 rounded flex items-center gap-1">
-                          <Download className="w-3 h-3 animate-bounce" /> Downloading Segments
+                          <Download className="w-3 h-3 animate-bounce" /> Downloading Stream
                         </span>
                       )}
 
@@ -289,67 +287,36 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
                   </div>
                 </div>
 
-                {/* Segment Progress Bar */}
-                <div className="space-y-2">
-                  <div className="flex justify-between text-xs font-mono">
-                    <span className="text-slate-300 font-bold">
-                      Segment Progress: {job.currentSegment} / {job.totalSegments} segments
+                {/* Integrated Terminal-Style Live Output Card (supports multiple lines at once in-place) */}
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 font-mono shadow-inner space-y-2">
+                  <div className="flex items-center justify-between text-[11px] text-slate-500 border-b border-slate-900 pb-2">
+                    <div className="flex items-center gap-2 text-slate-400 font-bold">
+                      <Terminal className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>N_m3u8DL-RE Terminal Output</span>
+                    </div>
+                    <span className="text-[10px] text-slate-500 font-mono">
+                      {job.status === 'completed'
+                        ? 'Completed'
+                        : job.status === 'muxing'
+                        ? 'FFmpeg Muxing'
+                        : job.status === 'failed'
+                        ? 'Failed'
+                        : 'Active'}
                     </span>
-                    <span className="text-cyan-400 font-black">{job.progress}%</span>
                   </div>
 
-                  <div className="w-full h-3 bg-slate-950 rounded-full overflow-hidden border border-slate-800 p-0.5">
-                    <div
-                      className={`h-full rounded-full transition-all duration-300 ${
-                        job.status === 'completed'
-                          ? 'bg-emerald-400'
-                          : job.status === 'failed'
-                          ? 'bg-red-500'
-                          : job.status === 'muxing'
-                          ? 'bg-purple-400'
-                          : 'bg-gradient-to-r from-cyan-500 to-blue-500'
-                      }`}
-                      style={{ width: `${job.progress}%` }}
-                    />
-                  </div>
-                </div>
-
-                {/* Speed & Telemetry Stats Bar */}
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs font-mono text-slate-300 bg-slate-950 p-3.5 rounded-xl border border-slate-800">
-                  <div className="flex items-center gap-2">
-                    <Gauge className="w-4 h-4 text-emerald-400" />
-                    <div>
-                      <span className="text-slate-500 block text-[10px]">CURRENT SPEED</span>
-                      <strong className="text-emerald-400 font-bold">{formatSpeed(job.currentSpeedBps)}</strong>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <Clock className="w-4 h-4 text-cyan-400" />
-                    <div>
-                      <span className="text-slate-500 block text-[10px]">ETA REMAINING</span>
-                      <strong className="text-white">{formatSeconds(job.etaSeconds)}</strong>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <Download className="w-4 h-4 text-blue-400" />
-                    <div>
-                      <span className="text-slate-500 block text-[10px]">SIZE DOWNLOADED</span>
-                      <strong className="text-white">
-                        {formatBytes(job.downloadedBytes)}
-                      </strong>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <Layers className="w-4 h-4 text-purple-400" />
-                    <div>
-                      <span className="text-slate-500 block text-[10px]">OUTPUT FILE</span>
-                      <strong className="text-purple-300 truncate block max-w-[120px]">
-                        {job.outputFile}
-                      </strong>
-                    </div>
+                  <div className="space-y-1 text-xs">
+                    {(job.terminalLines && job.terminalLines.length > 0
+                      ? job.terminalLines
+                      : [job.lastTerminalLine || (job.status === 'completed' ? `Output: /downloads/${job.outputFile}` : 'Executing stream download...')]
+                    ).map((tLine, lineIdx) => (
+                      <div key={lineIdx} className="flex items-start gap-2 overflow-hidden">
+                        <span className="text-cyan-400 font-bold select-none shrink-0 mt-0.5">$</span>
+                        <span className="font-mono text-emerald-400 truncate tracking-wide select-all">
+                          {tLine}
+                        </span>
+                      </div>
+                    ))}
                   </div>
                 </div>
 
