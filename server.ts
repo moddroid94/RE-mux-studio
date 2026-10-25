@@ -5,12 +5,18 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import {
   AudioTrack,
+  CustomHeader,
   DownloadJob,
   LogMessage,
   ManifestAnalysis,
   SubtitleTrack,
   VideoTrack,
 } from './src/types/stream.js';
+import {
+  buildDownloadJobPlan,
+  DownloadJobPlan,
+  parseHeaders,
+} from './src/utils/commandGenerator.js';
 import { parseStreamManifest } from './src/utils/manifestParser.js';
 
 interface ActiveJobInternal {
@@ -26,13 +32,91 @@ const activeJobsStore: Map<string, ActiveJobInternal> = new Map();
 const jobProgressListenerMap: Map<string, Set<JobProgressLambda>> = new Map();
 const globalProgressListeners: Set<GlobalProgressLambda> = new Set();
 
+// Ensure full RW permissions for created files & directories by setting umask to 0
+try {
+  process.umask(0);
+} catch {}
+
 // Ensure downloads directory exists
 const DOWNLOADS_DIR = path.resolve('./downloads');
 if (!fs.existsSync(DOWNLOADS_DIR)) {
-  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true, mode: 0o777 });
 }
 
-// Check system binary helper
+/**
+ * Ensures saved files and directories are not owned by root,
+ * applying world Read & Write (RW) permissions (0o666 for files, 0o777 for dirs)
+ * and chowning away from root (using PUID/PGID, host directory UID/GID, or standard non-root 1000:1000).
+ */
+function adjustFilePermissionsAndOwnership(targetPath: string): void {
+  try {
+    if (!fs.existsSync(targetPath)) return;
+
+    const stat = fs.statSync(targetPath);
+
+    // 1. World Read & Write permissions (rw-rw-rw- for files, rwxrwxrwx for directories)
+    try {
+      if (stat.isDirectory()) {
+        fs.chmodSync(targetPath, 0o777);
+        const entries = fs.readdirSync(targetPath);
+        for (const entry of entries) {
+          adjustFilePermissionsAndOwnership(path.join(targetPath, entry));
+        }
+      } else {
+        fs.chmodSync(targetPath, 0o666);
+      }
+    } catch {
+      // Ignored if filesystem doesn't support chmod (e.g. FAT/NTFS mounts)
+    }
+
+    // 2. Chown away from root if running as root in Docker/Linux
+    try {
+      const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+
+      let targetUid: number | null = null;
+      let targetGid: number | null = null;
+
+      const puid = process.env.PUID || process.env.UID;
+      const pgid = process.env.PGID || process.env.GID;
+
+      if (puid && !isNaN(parseInt(puid, 10))) {
+        targetUid = parseInt(puid, 10);
+      }
+      if (pgid && !isNaN(parseInt(pgid, 10))) {
+        targetGid = parseInt(pgid, 10);
+      }
+
+      // If not passed in env, inspect the owner of the downloads directory
+      if (targetUid === null && fs.existsSync(DOWNLOADS_DIR)) {
+        const downloadsStat = fs.statSync(DOWNLOADS_DIR);
+        if (downloadsStat.uid !== 0) {
+          targetUid = downloadsStat.uid;
+          targetGid = downloadsStat.gid;
+        }
+      }
+
+      // If running as root and no PUID configured, use standard non-root user (1000:1000)
+      if (isRoot && targetUid === null) {
+        targetUid = 1000;
+        targetGid = targetGid !== null ? targetGid : 1000;
+      }
+
+      if (targetUid !== null && targetUid !== 0) {
+        const gidToUse = targetGid !== null ? targetGid : targetUid;
+        fs.chownSync(targetPath, targetUid, gidToUse);
+      }
+    } catch {
+      // Ignored if chown is unsupported or user lacks CAP_CHOWN
+    }
+  } catch {
+    // Fail-safe
+  }
+}
+
+// Ensure DOWNLOADS_DIR itself is world writable on boot
+adjustFilePermissionsAndOwnership(DOWNLOADS_DIR);
+
+// Check system binary availability
 function checkSystemBinary(binName: string): boolean {
   try {
     execSync(`which ${binName} || where ${binName}`, { stdio: 'ignore' });
@@ -45,11 +129,13 @@ function checkSystemBinary(binName: string): boolean {
 const HAS_NM3U8DL = checkSystemBinary('N_m3u8DL-RE') || checkSystemBinary('m3u8dl-re');
 const HAS_FFMPEG = checkSystemBinary('ffmpeg');
 
-console.log(`[RE-Mux System Check] N_m3u8DL-RE Binary: ${HAS_NM3U8DL ? 'INSTALLED' : 'NOT FOUND (Docker mode)'}`);
-console.log(`[RE-Mux System Check] FFmpeg Binary: ${HAS_FFMPEG ? 'INSTALLED' : 'NOT FOUND (Docker mode)'}`);
+console.log(`[RE-Mux System Check] N_m3u8DL-RE Binary: ${HAS_NM3U8DL ? 'INSTALLED' : 'NOT FOUND (Web fallback)'}`);
+console.log(`[RE-Mux System Check] FFmpeg Binary: ${HAS_FFMPEG ? 'INSTALLED' : 'NOT FOUND (Web fallback)'}`);
 
-const MIN_PACE_MS = 1000; // Strict: max 1 broadcast every 1000ms (prevents high-frequency floods)
-
+/* =========================================================================
+   PACED EVENT BROADCASTER (Strict minimum 1000ms delay between pushes)
+   ========================================================================= */
+const MIN_PACE_MS = 1000;
 let lastGlobalBroadcastTime = 0;
 let globalTrailingTimer: NodeJS.Timeout | null = null;
 
@@ -81,7 +167,6 @@ function broadcastGlobalJobs(forceNow = false) {
     return;
   }
 
-  // If within cooldown period, schedule exactly one trailing timer if not already scheduled
   if (!globalTrailingTimer) {
     const delay = Math.max(50, MIN_PACE_MS - elapsed);
     globalTrailingTimer = setTimeout(() => {
@@ -132,652 +217,76 @@ function broadcastJobProgress(job: DownloadJob) {
   }
 }
 
-// Strictly paced notification function - cannot bypass 1000ms minimum window
 function notifyJobProgress(job: DownloadJob, force = false) {
   broadcastJobProgress(job);
   broadcastGlobalJobs(force);
 }
 
-async function startServer() {
-  const app = express();
-  const PORT = process.env.PORT || 3000;
-
-  app.use(express.json());
-
-  // Serve completed downloaded files safely without falling through to SPA index.html
-  app.get('/downloads/:filename', (req: Request, res: Response) => {
-    const filename = path.basename(req.params.filename);
-    const filePath = path.join(DOWNLOADS_DIR, filename);
-
-    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-      return res.download(filePath, filename);
-    }
-
-    try {
-      const items = fs.readdirSync(DOWNLOADS_DIR);
-      for (const item of items) {
-        const subDir = path.join(DOWNLOADS_DIR, item);
-        if (fs.statSync(subDir).isDirectory()) {
-          const nestedPath = path.join(subDir, filename);
-          if (fs.existsSync(nestedPath) && fs.statSync(nestedPath).isFile()) {
-            return res.download(nestedPath, filename);
-          }
-        }
-      }
-    } catch {}
-
-    return res.status(404).send('File not found in downloads directory.');
-  });
-  app.use('/downloads', express.static(DOWNLOADS_DIR));
-
-  // System Status Endpoint
-  app.get('/api/system-status', (_req: Request, res: Response) => {
-    return res.json({
-      hasNm3u8dl: HAS_NM3U8DL,
-      hasFfmpeg: HAS_FFMPEG,
-      downloadsDir: DOWNLOADS_DIR,
-      isDocker: fs.existsSync('/.dockerenv'),
-    });
-  });
-
-  // API Route: Real Stream Manifest Probe & Track Extractor
-  app.post('/api/probe', async (req: Request, res: Response) => {
-    try {
-      const { url, headers, customTitle } = req.body;
-
-      if (!url || typeof url !== 'string' || !url.trim()) {
-        return res.status(400).json({ error: 'Valid Manifest URL is required' });
-      }
-
-      const reqHeaders: Record<string, string> = {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Accept: '*/*',
-        ...(headers || {}),
-      };
-
-      let manifestText = '';
-      let fetchSuccess = false;
-      let finalUrl = url.trim();
-
-      // 1. HTTP Manifest Fetch with Redirect & Base URL Tracking
-      if (finalUrl.startsWith('http://') || finalUrl.startsWith('https://')) {
-        try {
-          const response = await fetch(finalUrl, { headers: reqHeaders, redirect: 'follow' });
-          if (response.ok) {
-            manifestText = await response.text();
-            fetchSuccess = true;
-            if (response.url) finalUrl = response.url;
-          }
-        } catch (fetchErr: any) {
-          console.warn('[Probe Warning] Direct HTTP fetch failed:', fetchErr.message);
-        }
-      }
-
-      let analysis: ManifestAnalysis;
-
-      if (fetchSuccess && manifestText) {
-        analysis = parseStreamManifest(manifestText, finalUrl, customTitle);
-      } else {
-        analysis = parseStreamManifest(
-          `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.64002a"\nstream.m3u8`,
-          finalUrl,
-          customTitle || 'Direct Stream URL'
-        );
-      }
-
-      // 2. Native CLI Probe via N_m3u8DL-RE (if binary is installed)
-      if (HAS_NM3U8DL) {
-        const cliTracks = await probeViaNm3u8dlCLI(finalUrl, headers);
-        if (cliTracks) {
-          if (cliTracks.videoTracks.length > 0) {
-            analysis.videoTracks = mergeTracks(analysis.videoTracks, cliTracks.videoTracks);
-          }
-          if (cliTracks.audioTracks.length > 0) {
-            analysis.audioTracks = mergeTracks(analysis.audioTracks, cliTracks.audioTracks);
-          }
-          if (cliTracks.subtitleTracks.length > 0) {
-            analysis.subtitleTracks = mergeTracks(analysis.subtitleTracks, cliTracks.subtitleTracks);
-          }
-        }
-      }
-
-      return res.json({ success: true, analysis });
-    } catch (err: any) {
-      return res.status(500).json({ error: err.message || 'Manifest analysis failed' });
-    }
-  });
-
-  // API Route: Start Download Job
-  app.post('/api/download/start', (req: Request, res: Response) => {
-    try {
-      const { url, title, commandExecuted, selectionsSummary, commandConfig } = req.body;
-
-      const jobId = 'job_' + Date.now();
-      const saveNameMatch = commandExecuted?.match(/--save-name\s+"([^"]+)"/) || commandExecuted?.match(/--save-name\s+([^\s]+)/);
-      const formatMatch = commandExecuted?.match(/-M\s+format=([a-zA-Z0-9]+)/) || commandExecuted?.match(/format=([a-zA-Z0-9]+)/);
-
-      const safeTitle = (title || 'Stream').replace(/[^a-zA-Z0-9_-]/g, '_');
-      const saveName = saveNameMatch ? saveNameMatch[1] : safeTitle;
-      const containerFormat = formatMatch ? formatMatch[1] : (commandConfig?.containerFormat || 'mkv');
-      const outputFilename = `${saveName}.${containerFormat}`;
-
-      const newJob: DownloadJob = {
-        id: jobId,
-        url,
-        title: title || 'Stream Download ' + jobId,
-        status: 'parsing',
-        progress: 0,
-        currentSegment: 0,
-        totalSegments: 100,
-        currentSpeedBps: 0,
-        downloadedBytes: 0,
-        totalBytes: 0,
-        elapsedSeconds: 0,
-        etaSeconds: 0,
-        speedHistory: [0],
-        commandExecuted: commandExecuted || 'N_m3u8DL-RE ...',
-        selectionsSummary: selectionsSummary || {
-          video: '1080p',
-          audio: ['Default'],
-          subtitles: ['None'],
-        },
-        logs: [
-          {
-            id: 'log_0',
-            timestamp: new Date().toISOString().substring(11, 19),
-            level: 'info',
-            message: `[RE-Mux Studio] Launching task ${jobId}...`,
-          },
-          {
-            id: 'log_1',
-            timestamp: new Date().toISOString().substring(11, 19),
-            level: 'info',
-            message: `Executing CLI Command: ${commandExecuted}`,
-          },
-        ],
-        outputFile: outputFilename,
-        createdAt: new Date().toISOString(),
-      };
-
-      const internalJob: ActiveJobInternal = { job: newJob };
-      activeJobsStore.set(jobId, internalJob);
-
-      // Launch process with paced background progress reporting
-      runDownloadProcess(jobId, url, commandExecuted, commandConfig, outputFilename);
-
-      return res.json({ success: true, job: newJob });
-    } catch (err: any) {
-      return res.status(500).json({ error: err.message });
-    }
-  });
-
-  //EXTENSION COMPATIBILITY LAYER
-  //fake login ok response
-  app.post('/api/auth/login', (req: Request, res: Response) => {
-    return res.json({
-      id: 1,
-      username: req.body.username,
-    });
-  });
-  
-  // API Route: Automated Task Probe & Start Download Endpoint
-  app.post('/api/tasks', async (req: Request, res: Response) => {
-    try {
-      const url = req.body.url || req.body.stream_url || req.body.url_stream;
-      const outputName =
-        req.body.output_name ||
-        req.body.outputName ||
-        req.body.title ||
-        req.body.customTitle ||
-        'Stream Download';
-      const rawHeaders = req.body.headers || req.body.custom_headers || req.body.customHeaders;
-
-      if (!url || typeof url !== 'string' || !url.trim()) {
-        return res.status(400).json({ error: 'Valid stream URL is required in "url" field' });
-      }
-
-      const targetUrl = url.trim();
-      const { headerObj, headerFlags } = parseHeadersInput(rawHeaders);
-
-      // Fetch and discover tracks from manifest using HTTP headers or CLI probe
-      const reqHeaders: Record<string, string> = {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Accept: '*/*',
-        ...headerObj,
-      };
-
-      let discoveredLangs: { audio: string[]; sub: string[] } = { audio: [], sub: [] };
-
-      // 1. Direct HTTP Manifest Fetch & Parse (instant and detects all subtitle/audio tracks)
-      try {
-        if (targetUrl.startsWith('http://') || targetUrl.startsWith('https://')) {
-          const resp = await fetch(targetUrl, { headers: reqHeaders, redirect: 'follow' });
-          if (resp.ok) {
-            const manifestText = await resp.text();
-            const analysis = parseStreamManifest(manifestText, resp.url || targetUrl, outputName);
-            if (analysis) {
-              if (analysis.audioTracks.length > 0) {
-                discoveredLangs.audio = Array.from(
-                  new Set(analysis.audioTracks.flatMap((a) => [a.language, a.name]).filter(Boolean))
-                );
-              }
-              if (analysis.subtitleTracks.length > 0) {
-                discoveredLangs.sub = Array.from(
-                  new Set(analysis.subtitleTracks.flatMap((s) => [s.language, s.name]).filter(Boolean))
-                );
-              }
-            }
-          }
-        }
-      } catch (fetchErr: any) {
-        console.warn('[Tasks API Manifest Fetch Warning]', fetchErr.message);
-      }
-
-      // 2. Fallback CLI Probe if no tracks found
-      if (discoveredLangs.sub.length === 0 && HAS_NM3U8DL) {
-        try {
-          const cliTracks = await probeViaNm3u8dlCLI(targetUrl, headerObj);
-          if (cliTracks) {
-            if (cliTracks.audioTracks.length > 0) {
-              discoveredLangs.audio = Array.from(
-                new Set([...discoveredLangs.audio, ...cliTracks.audioTracks.flatMap((a) => [a.language, a.name]).filter(Boolean)])
-              );
-            }
-            if (cliTracks.subtitleTracks.length > 0) {
-              discoveredLangs.sub = Array.from(
-                new Set([...discoveredLangs.sub, ...cliTracks.subtitleTracks.flatMap((s) => [s.language, s.name]).filter(Boolean)])
-              );
-            }
-          }
-        } catch (probeErr) {
-          console.warn('[Tasks API Probe Warning]', probeErr);
-        }
-      }
-
-      // Check discovered subtitle languages: matches 2-letter (en, it), 3-letter (eng, ita), or language names (english, italian)
-      const subLangs = discoveredLangs.sub.map((s) => s.toLowerCase());
-      const hasEngSub = subLangs.some(
-        (s) => s === 'en' || s.includes('eng') || s.includes('english')
-      );
-      const hasItaSub = subLangs.some(
-        (s) => s === 'it' || s.includes('ita') || s.includes('italian')
-      );
-
-      let subFlag = '';
-      if (hasEngSub) {
-        if (hasItaSub) {
-          subFlag = '--select-subtitle "lang=eng|ita"';
-        } else {
-          subFlag = '--select-subtitle "lang=eng"';
-        }
-      } else {
-        if (hasItaSub) {
-          subFlag = '--select-subtitle "lang=ita"';
-        } else {
-          subFlag = '';
-        }
-      }
-      const subSummary = (hasEngSub && hasItaSub) ? ['eng', 'ita'] : hasEngSub ? ['eng'] : hasItaSub ? ['ita'] : ['None'];
-
-      // Format safe output filename and save name
-      const cleanBase = outputName.replace(/[/\\?%*:|"<>']/g, '_').trim() || 'Stream';
-      const safeSaveName = cleanBase.replace(/[\s]+/g, '_').replace(/_+/g, '_');
-
-      const cmdParts = [
-        'N_m3u8DL-RE',
-        `"${targetUrl}"`,
-        '-sv best',
-        '-sa all',
-        '-M format=mp4',
-        '--thread-count 8',
-        '--download-retry-count 3',
-        '--save-dir "./downloads"',
-        `--save-name "${safeSaveName}"`,
-      ];
-
-      if (subFlag) {
-        cmdParts.push(subFlag);
-      }
-
-      if (headerFlags.length > 0) {
-        for (let i = 0; i < headerFlags.length; i += 2) {
-          cmdParts.push(`${headerFlags[i]} "${headerFlags[i + 1]}"`);
-        }
-      }
-
-      const commandExecuted = cmdParts.join(' ');
-      const jobId = 'job_' + Date.now();
-      const outputFilename = `${safeSaveName}.mp4`;
-
-      const newJob: DownloadJob = {
-        id: jobId,
-        url: targetUrl,
-        title: outputName,
-        status: 'parsing',
-        progress: 0,
-        currentSegment: 0,
-        totalSegments: 100,
-        currentSpeedBps: 0,
-        downloadedBytes: 0,
-        totalBytes: 0,
-        elapsedSeconds: 0,
-        etaSeconds: 0,
-        speedHistory: [0],
-        commandExecuted,
-        selectionsSummary: {
-          video: 'Best Quality',
-          audio: discoveredLangs.audio.length > 0 ? discoveredLangs.audio : ['All Audio Tracks'],
-          subtitles: subSummary,
-        },
-        logs: [
-          {
-            id: 'log_0',
-            timestamp: new Date().toISOString().substring(11, 19),
-            level: 'info',
-            message: `[API Task Created] Automated task ${jobId} initialized for "${outputName}"`,
-          },
-          {
-            id: 'log_1',
-            timestamp: new Date().toISOString().substring(11, 19),
-            level: 'info',
-            message: `Executing CLI Command: ${commandExecuted}`,
-          },
-        ],
-        outputFile: outputFilename,
-        createdAt: new Date().toISOString(),
-      };
-
-      const internalJob: ActiveJobInternal = { job: newJob };
-      activeJobsStore.set(jobId, internalJob);
-
-      // Launch process with paced background progress reporting
-      runDownloadProcess(
-        jobId,
-        targetUrl,
-        commandExecuted,
-        { containerFormat: 'mp4' },
-        outputFilename
-      );
-
-      return res.json({
-        success: true,
-        jobId,
-        job: newJob,
-        commandExecuted,
-      });
-    } catch (err: any) {
-      return res.status(500).json({ error: err.message || 'Failed to process task request' });
-    }
-  });
-
-  // API Route: Get all jobs
-  app.get('/api/download/jobs', (_req: Request, res: Response) => {
-    const jobs = Array.from(activeJobsStore.values()).map((ij) => ij.job);
-    return res.json({ success: true, jobs });
-  });
-
-  // API Route: Global SSE Stream for ALL Jobs updates
-  app.get('/api/download/events', (req: Request, res: Response) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-
-    const sendAllJobs = () => {
-      if (res.writableEnded || res.closed) return;
-      const jobs = Array.from(activeJobsStore.values()).map((ij) => ij.job);
-      res.write(`data: ${JSON.stringify({ jobs })}\n\n`);
-    };
-
-    sendAllJobs();
-
-    // Register callback lambda for strictly paced global updates (max 1/sec)
-    const globalProgressLambda = () => sendAllJobs();
-    globalProgressListeners.add(globalProgressLambda);
-
-    // Keep-alive heartbeat every 15s (does not spam full job state)
-    const heartbeat = setInterval(() => {
-      if (res.writableEnded || res.closed) {
-        clearInterval(heartbeat);
-        return;
-      }
-      res.write(': keepalive\n\n');
-    }, 15000);
-
-    req.on('close', () => {
-      globalProgressListeners.delete(globalProgressLambda);
-      clearInterval(heartbeat);
-    });
-  });
-
-  // API Route: SSE Stream for a specific job's real-time progress & logs
-  app.get('/api/download/stream/:jobId', (req: Request, res: Response) => {
-    const { jobId } = req.params;
-    const item = activeJobsStore.get(jobId);
-
-    if (!item) {
-      return res.status(404).json({ error: 'Job not found' });
-    }
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-
-    const sendJobUpdate = (updatedJob: DownloadJob) => {
-      if (res.writableEnded || res.closed) return;
-      res.write(`data: ${JSON.stringify({ job: updatedJob })}\n\n`);
-    };
-
-    sendJobUpdate(item.job);
-
-    // Register callback lambda for strictly paced per-job updates (max 1/sec)
-    if (!jobProgressListenerMap.has(jobId)) {
-      jobProgressListenerMap.set(jobId, new Set());
-    }
-    const jobListeners = jobProgressListenerMap.get(jobId)!;
-    jobListeners.add(sendJobUpdate);
-
-    // Keep-alive heartbeat every 15s
-    const heartbeat = setInterval(() => {
-      if (res.writableEnded || res.closed) {
-        clearInterval(heartbeat);
-        return;
-      }
-      res.write(': keepalive\n\n');
-    }, 15000);
-
-    req.on('close', () => {
-      jobListeners.delete(sendJobUpdate);
-      clearInterval(heartbeat);
-    });
-  });
-
-  // API Route: Download File
-  app.get('/api/download/file/:filename', (req: Request, res: Response) => {
-    const filename = path.basename(req.params.filename);
-    const filePath = path.join(DOWNLOADS_DIR, filename);
-
-    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-      return res.download(filePath, filename);
-    }
-
-    try {
-      const items = fs.readdirSync(DOWNLOADS_DIR);
-      for (const item of items) {
-        const subDir = path.join(DOWNLOADS_DIR, item);
-        if (fs.statSync(subDir).isDirectory()) {
-          const nestedPath = path.join(subDir, filename);
-          if (fs.existsSync(nestedPath) && fs.statSync(nestedPath).isFile()) {
-            return res.download(nestedPath, filename);
-          }
-        }
-      }
-    } catch {}
-
-    return res.status(404).send('File not found in downloads directory.');
-  });
-
-  // API Route: Control Job
-  app.post('/api/download/control', (req: Request, res: Response) => {
-    const { jobId, action } = req.body;
-    const item = activeJobsStore.get(jobId);
-
-    if (!item) {
-      return res.status(404).json({ error: 'Job not found' });
-    }
-
-    if (action === 'cancel') {
-      if (item.process) {
-        try {
-          item.process.kill('SIGINT');
-        } catch (e) {}
-      }
-      if (item.intervalTimer) clearInterval(item.intervalTimer);
-      item.job.status = 'failed';
-      item.job.error = 'Cancelled by user';
-      item.job.currentSpeedBps = 0;
-      addLog(item.job, 'error', '[Process] Execution terminated by user (SIGINT)');
-      notifyJobProgress(item.job);
-    } else if (action === 'pause') {
-      item.job.status = 'paused';
-      item.job.currentSpeedBps = 0;
-      addLog(item.job, 'warn', '[Process] Download task paused by user');
-      notifyJobProgress(item.job);
-    } else if (action === 'resume') {
-      item.job.status = 'downloading_video';
-      addLog(item.job, 'info', '[Process] Download task resumed');
-      notifyJobProgress(item.job);
-    }
-
-    return res.json({ success: true, job: item.job });
-  });
-
-  // Proxy Endpoint for HLS M3U8 Manifests/Segments
-  app.get('/api/proxy', async (req: Request, res: Response) => {
-    const targetUrl = req.query.url as string;
-    if (!targetUrl) {
-      return res.status(400).send('URL query parameter required');
-    }
-
-    try {
-      const response = await fetch(targetUrl, {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          Accept: '*/*',
-        },
-      });
-
-      if (!response.ok) {
-        return res.status(response.status).send(`Failed to proxy stream: ${response.statusText}`);
-      }
-
-      const contentType = response.headers.get('content-type') || 'text/plain';
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Access-Control-Allow-Origin', '*');
-
-      const bodyBuffer = await response.arrayBuffer();
-      return res.send(Buffer.from(bodyBuffer));
-    } catch (err: any) {
-      return res.status(500).send(`Proxy error: ${err.message}`);
-    }
-  });
-
-  // Mount Vite in dev mode or serve static files in production
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'custom',
-    });
-    app.use(vite.middlewares);
-    app.use('*', async (req, res, next) => {
-      try {
-        const url = req.originalUrl;
-        let template = await fs.promises.readFile(
-          path.resolve('./index.html'),
-          'utf-8'
-        );
-        template = await vite.transformIndexHtml(url, template);
-        res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
-      } catch (e) {
-        vite.ssrFixStacktrace(e as Error);
-        next(e);
-      }
-    });
-  } else {
-    app.use(express.static(path.resolve('./dist')));
-    app.use('*', (_req, res) => {
-      res.sendFile(path.resolve('./dist/index.html'));
-    });
-  }
-
-  app.listen(PORT, () => {
-    console.log(`RE-Mux Studio server active on http://localhost:${PORT}`);
-  });
-}
-
-// Helper to parse header inputs from string, object, or array
-function parseHeadersInput(headersInput: any): {
-  headerObj: Record<string, string>;
-  headerFlags: string[];
-} {
-  const headerObj: Record<string, string> = {};
-  const headerFlags: string[] = [];
-
-  if (!headersInput) return { headerObj, headerFlags };
-
-  const processLine = (line: string) => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    const colonIndex = trimmed.indexOf(':');
-    if (colonIndex > 0) {
-      const key = trimmed.substring(0, colonIndex).trim();
-      const value = trimmed.substring(colonIndex + 1).trim();
-      if (key && value) {
-        headerObj[key] = value;
-        headerFlags.push('-H', `${key}: ${value}`);
-      }
-    }
+/* =========================================================================
+   STREAM MANIFEST PROBING (Single Shared Resolver)
+   ========================================================================= */
+async function resolveStreamManifest(
+  url: string,
+  headers: CustomHeader[] = [],
+  customTitle?: string
+): Promise<ManifestAnalysis> {
+  const reqHeaders: Record<string, string> = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    Accept: '*/*',
   };
+  headers.forEach((h) => {
+    if (h.key && h.value) reqHeaders[h.key] = h.value;
+  });
 
-  if (typeof headersInput === 'string') {
-    headersInput.split(/\r?\n/).forEach(processLine);
-  } else if (Array.isArray(headersInput)) {
-    headersInput.forEach((item) => {
-      if (typeof item === 'string') {
-        processLine(item);
-      } else if (item && typeof item === 'object') {
-        const key = item.key || item.name || item.header;
-        const val = item.value || item.val;
-        if (key && val) {
-          const kStr = String(key).trim();
-          const vStr = String(val).trim();
-          headerObj[kStr] = vStr;
-          headerFlags.push('-H', `${kStr}: ${vStr}`);
-        }
+  let manifestText = '';
+  let finalUrl = url.trim();
+
+  if (finalUrl.startsWith('http://') || finalUrl.startsWith('https://')) {
+    try {
+      const response = await fetch(finalUrl, { headers: reqHeaders, redirect: 'follow' });
+      if (response.ok) {
+        manifestText = await response.text();
+        if (response.url) finalUrl = response.url;
       }
-    });
-  } else if (typeof headersInput === 'object' && headersInput !== null) {
-    for (const [key, value] of Object.entries(headersInput)) {
-      if (key && value) {
-        const kStr = String(key).trim();
-        const vStr = String(value).trim();
-        headerObj[kStr] = vStr;
-        headerFlags.push('-H', `${kStr}: ${vStr}`);
+    } catch (fetchErr: any) {
+      console.warn('[Probe Warning] Direct HTTP fetch failed:', fetchErr.message);
+    }
+  }
+
+  let analysis: ManifestAnalysis;
+  if (manifestText) {
+    analysis = parseStreamManifest(manifestText, finalUrl, customTitle);
+  } else {
+    analysis = parseStreamManifest(
+      `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.64002a"\nstream.m3u8`,
+      finalUrl,
+      customTitle || 'Direct Stream URL'
+    );
+  }
+
+  // Supplementary CLI Probe via N_m3u8DL-RE if binary exists and few tracks were discovered
+  if (HAS_NM3U8DL && (analysis.videoTracks.length === 0 || analysis.audioTracks.length === 0)) {
+    const cliTracks = await probeViaNm3u8dlCLI(finalUrl, headers);
+    if (cliTracks) {
+      if (cliTracks.videoTracks.length > 0) {
+        analysis.videoTracks = mergeTracks(analysis.videoTracks, cliTracks.videoTracks);
+      }
+      if (cliTracks.audioTracks.length > 0) {
+        analysis.audioTracks = mergeTracks(analysis.audioTracks, cliTracks.audioTracks);
+      }
+      if (cliTracks.subtitleTracks.length > 0) {
+        analysis.subtitleTracks = mergeTracks(analysis.subtitleTracks, cliTracks.subtitleTracks);
       }
     }
   }
 
-  return { headerObj, headerFlags };
+  return analysis;
 }
 
-// Native CLI Probe Helper using N_m3u8DL-RE CLI
 function probeViaNm3u8dlCLI(
   url: string,
-  headers?: Record<string, string>
+  headers: CustomHeader[] = []
 ): Promise<{
   videoTracks: VideoTrack[];
   audioTracks: AudioTrack[];
@@ -786,11 +295,9 @@ function probeViaNm3u8dlCLI(
   return new Promise((resolve) => {
     const binary = checkSystemBinary('N_m3u8DL-RE') ? 'N_m3u8DL-RE' : 'm3u8dl-re';
     const headerFlags: string[] = [];
-    if (headers) {
-      Object.entries(headers).forEach(([k, v]) => {
-        if (k && v) headerFlags.push('-H', `${k}: ${v}`);
-      });
-    }
+    headers.forEach((h) => {
+      if (h.key && h.value) headerFlags.push('-H', `${h.key}: ${h.value}`);
+    });
 
     const args = [url, '--no-log', ...headerFlags];
     const proc = spawn(binary, args, { timeout: 5000 });
@@ -833,7 +340,7 @@ function probeViaNm3u8dlCLI(
             trimmed.match(/lang="([^"]+)"/i) ||
             trimmed.match(/Aud\*?\s+([a-zA-Z-]+)\s*\|/i) ||
             trimmed.match(/\|\s*([a-zA-Z]{2,4})\b/i);
-          const nameM = trimmed.match(/Name:\s*([^\s,]+)/i) || trimmed.match(/Aud\*?\s+([^\s|]+)\s*\|/i) || trimmed.match(/\|\s*([^\n━]+)/);
+          const nameM = trimmed.match(/Name:\s*([^\\s,]+)/i) || trimmed.match(/Aud\*?\s+([^\\s|]+)\s*\|/i) || trimmed.match(/\|\s*([^\\n━]+)/);
           const lang = (langM ? langM[1] : (trimmed.toLowerCase().includes('ita') ? 'ita' : trimmed.toLowerCase().includes('eng') ? 'eng' : 'und')).toLowerCase();
           audioTracks.push({
             id: `cli_a_${audioTracks.length + 1}_${lang}`,
@@ -852,7 +359,7 @@ function probeViaNm3u8dlCLI(
             trimmed.match(/lang="([^"]+)"/i) ||
             trimmed.match(/Sub\*?\s+([a-zA-Z-]+)\s*\|/i) ||
             trimmed.match(/\|\s*([a-zA-Z]{2,4})\b/i);
-          const nameM = trimmed.match(/\|\s*([^\n━]+)/);
+          const nameM = trimmed.match(/\|\s*([^\\n━]+)/);
           const lang = (langM ? langM[1] : (trimmed.toLowerCase().includes('ita') ? 'ita' : trimmed.toLowerCase().includes('eng') ? 'eng' : 'und')).toLowerCase();
           subtitleTracks.push({
             id: `cli_s_${subtitleTracks.length + 1}_${lang}`,
@@ -886,9 +393,13 @@ function mergeTracks<T extends { id: string }>(existing: T[], cliDiscovered: T[]
   return merged;
 }
 
+/* =========================================================================
+   OUTPUT FILE RESOLUTION HELPER
+   ========================================================================= */
 function locateAndRelocateOutputFile(targetFilename: string): { filename: string; bytes: number } {
   const directPath = path.join(DOWNLOADS_DIR, targetFilename);
   if (fs.existsSync(directPath) && fs.statSync(directPath).isFile()) {
+    adjustFilePermissionsAndOwnership(directPath);
     return { filename: targetFilename, bytes: fs.statSync(directPath).size };
   }
 
@@ -944,6 +455,10 @@ function locateAndRelocateOutputFile(targetFilename: string): { filename: string
       }
     }
 
+    if (fs.existsSync(destPath)) {
+      adjustFilePermissionsAndOwnership(destPath);
+    }
+
     const size = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
     return { filename: foundName, bytes: size };
   }
@@ -951,13 +466,59 @@ function locateAndRelocateOutputFile(targetFilename: string): { filename: string
   return { filename: targetFilename, bytes: 0 };
 }
 
-// Real Process Execution Engine with Strictly Paced Event Reporting
+/* =========================================================================
+   TASK PROCESS EXECUTION ENGINE
+   ========================================================================= */
+function createAndStartJob(plan: DownloadJobPlan): DownloadJob {
+  const jobId = 'job_' + Date.now();
+
+  const newJob: DownloadJob = {
+    id: jobId,
+    url: plan.url,
+    title: plan.title,
+    status: 'parsing',
+    progress: 0,
+    currentSegment: 0,
+    totalSegments: 100,
+    currentSpeedBps: 0,
+    downloadedBytes: 0,
+    totalBytes: 0,
+    elapsedSeconds: 0,
+    etaSeconds: 0,
+    speedHistory: [0],
+    commandExecuted: plan.commandExecuted,
+    selectionsSummary: plan.selectionsSummary,
+    logs: [
+      {
+        id: 'log_0',
+        timestamp: new Date().toISOString().substring(11, 19),
+        level: 'info',
+        message: `[RE-Mux Engine] Task ${jobId} initialized: "${plan.title}"`,
+      },
+      {
+        id: 'log_1',
+        timestamp: new Date().toISOString().substring(11, 19),
+        level: 'info',
+        message: `Command: ${plan.commandExecuted}`,
+      },
+    ],
+    outputFile: plan.outputFile,
+    createdAt: new Date().toISOString(),
+  };
+
+  const internalJob: ActiveJobInternal = { job: newJob };
+  activeJobsStore.set(jobId, internalJob);
+
+  runDownloadProcess(jobId, plan.outputFile, plan.commandExecuted);
+  notifyJobProgress(newJob, true);
+
+  return newJob;
+}
+
 function runDownloadProcess(
   jobId: string,
-  url: string,
-  commandExecuted: string,
-  commandConfig: any,
-  outputFilename: string
+  outputFilename: string,
+  commandExecuted: string
 ) {
   const item = activeJobsStore.get(jobId);
   if (!item) return;
@@ -965,19 +526,10 @@ function runDownloadProcess(
   const job = item.job;
   const binaryToUse = HAS_NM3U8DL ? (checkSystemBinary('N_m3u8DL-RE') ? 'N_m3u8DL-RE' : 'm3u8dl-re') : null;
 
-  // Callback helper lambda
-  const reportProgress = (force = false) => {
-    notifyJobProgress(job, force);
-  };
-
   if (binaryToUse) {
-    addLog(job, 'info', `[RE-Mux Execution] Spawning binary: ${binaryToUse}`);
-    reportProgress();
+    addLog(job, 'info', `[RE-Mux Execution] Spawning native binary: ${binaryToUse}`);
 
     const rawArgs = parseArgsFromCommandString(commandExecuted, binaryToUse);
-
-    // Ensure non-interactive execution flags
-    
     if (!rawArgs.includes('--ui-language')) {
       rawArgs.push('--ui-language', 'en-US');
     }
@@ -988,9 +540,7 @@ function runDownloadProcess(
 
     if (hasScript) {
       const esc = (arg: string) => {
-        if (/^[a-zA-Z0-9_.\-\/=]+$/.test(arg)) {
-          return arg;
-        }
+        if (/^[a-zA-Z0-9_.\-\/=]+$/.test(arg)) return arg;
         return `'${arg.replace(/'/g, "'\\''")}'`;
       };
       const fullCmdString = `${binaryToUse} ${rawArgs.map(esc).join(' ')}`;
@@ -1009,15 +559,13 @@ function runDownloadProcess(
         },
       });
       item.process = child;
-
       child.stdin?.end();
 
       job.status = 'downloading_video';
-      reportProgress();
 
       let stdoutBuffer = '';
       let stderrBuffer = '';
-
+      let lastProgressLogTime = 0;
       const trackMap = new Map<string, { current: number; total: number; speedBps: number }>();
       const startTimestamp = Date.now();
 
@@ -1031,6 +579,7 @@ function runDownloadProcess(
         return Math.round(val);
       };
 
+      // Paced timer: ticks once per second to calculate elapsed time, update stats, and emit SSE
       const timer = setInterval(() => {
         if (job.status === 'completed' || job.status === 'failed') {
           clearInterval(timer);
@@ -1047,13 +596,10 @@ function runDownloadProcess(
           }
         }
 
-        reportProgress();
+        notifyJobProgress(job);
       }, 1000);
 
-      const stripAnsi = (str: string) =>
-        str.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
-
-      let lastProgressLogTime = 0;
+      const stripAnsi = (str: string) => str.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 
       const handleLine = (line: string) => {
         const cleanLine = stripAnsi(line).trim();
@@ -1067,8 +613,6 @@ function runDownloadProcess(
           addLog(job, 'info', cleanLine);
         }
 
-        // Update stage/status based on N_m3u8DL-RE track markers
-        const oldStatus = job.status;
         if (cleanLine.includes('Downloading video') || cleanLine.startsWith('Vid') || cleanLine.includes('Vid*')) {
           job.status = 'downloading_video';
         } else if (cleanLine.includes('Downloading audio') || cleanLine.startsWith('Aud') || cleanLine.includes('Aud*')) {
@@ -1093,65 +637,35 @@ function runDownloadProcess(
           ? cleanLine.substring(segMatch.index)
           : cleanLine;
 
-        // Extract Size (e.g. 246MB/250, 241.46MB/1, 241.46MB/1.48GB, or 15.20MB/150MB)
+        // Size parsing
         const sizeMatch = searchTarget.match(/([\d.]+)\s*(GB|GiB|MB|MiB|KB|KiB|B)\s*\/\s*([\d.]+)\s*(GB|GiB|MB|MiB|KB|KiB|B)?/i);
         if (sizeMatch) {
-          const dlVal = sizeMatch[1];
-          const dlUnit = sizeMatch[2];
-          const totVal = sizeMatch[3];
-          const explicitTotUnit = sizeMatch[4];
+          const dlBytes = parseBytes(sizeMatch[1], sizeMatch[2]);
+          if (dlBytes > 0) job.downloadedBytes = dlBytes;
 
-          const dlBytes = parseBytes(dlVal, dlUnit);
-          if (dlBytes > 0) {
-            job.downloadedBytes = dlBytes;
-          }
-
-          const dlValNum = parseFloat(dlVal);
-          const totValNum = parseFloat(totVal);
           let totBytes = 0;
-
-          if (explicitTotUnit) {
-            totBytes = parseBytes(totVal, explicitTotUnit);
-          } else if (!isNaN(totValNum)) {
-            if (totValNum >= dlValNum) {
-              // e.g. 246MB/250 -> 250 is in same unit (MB)
-              totBytes = parseBytes(totVal, dlUnit);
-            } else {
-              // e.g. 241.46MB/1 or 241.46MB/1.5 -> totVal is in GB
-              const higherUnit = dlUnit.toUpperCase().startsWith('K') ? 'MB' : dlUnit.toUpperCase().startsWith('M') ? 'GB' : 'TB';
-              totBytes = parseBytes(totVal, higherUnit);
+          if (sizeMatch[4]) {
+            totBytes = parseBytes(sizeMatch[3], sizeMatch[4]);
+          } else {
+            const dlVal = parseFloat(sizeMatch[1]);
+            const totVal = parseFloat(sizeMatch[3]);
+            if (!isNaN(totVal)) {
+              totBytes = parseBytes(sizeMatch[3], totVal >= dlVal ? sizeMatch[2] : 'GB');
             }
           }
-
-          if (job.progress > 0 && dlBytes > 0) {
-            const calculatedTotal = Math.round(dlBytes / (job.progress / 100));
-            if (calculatedTotal >= dlBytes) {
-              if (totBytes === 0 || Math.abs(calculatedTotal - totBytes) / totBytes > 0.1) {
-                totBytes = calculatedTotal;
-              }
-            }
-          }
-
-          if (totBytes >= dlBytes) {
-            job.totalBytes = totBytes;
-          }
+          if (totBytes >= dlBytes) job.totalBytes = totBytes;
         }
 
-        // Extract Speed (e.g. 2.66MBps, 12.5MB/s, 850KBps)
+        // Speed parsing
         const speedMatch = searchTarget.match(/([\d.]+)\s*(GBps|GiBps|MBps|MiBps|KBps|KiBps|Bps|GB\/s|GiB\/s|MB\/s|MiB\/s|KB\/s|KiB\/s|B\/s|M\/s|K\/s|Gbps|Mbps|Kbps)/i);
         if (speedMatch) {
           const val = parseFloat(speedMatch[1]);
           const unit = speedMatch[2].toUpperCase();
-          let bps = 0;
-          if (unit.startsWith('G')) {
-            bps = val * 1024 * 1024 * 1024;
-          } else if (unit.startsWith('M')) {
-            bps = val * 1024 * 1024;
-          } else if (unit.startsWith('K')) {
-            bps = val * 1024;
-          } else {
-            bps = val;
-          }
+          let bps = val;
+          if (unit.startsWith('G')) bps = val * 1024 * 1024 * 1024;
+          else if (unit.startsWith('M')) bps = val * 1024 * 1024;
+          else if (unit.startsWith('K')) bps = val * 1024;
+
           if (bps > 0) {
             job.currentSpeedBps = Math.round(bps);
             job.speedHistory.push(job.currentSpeedBps);
@@ -1159,82 +673,37 @@ function runDownloadProcess(
           }
         }
 
-        // Extract ETA (e.g. 00:07:33 or ~01h29m33s)
+        // ETA parsing
         const etaMatch = searchTarget.match(/\b(\d{2}):(\d{2}):(\d{2})\b/);
-        let hasDirectEta = false;
         if (etaMatch) {
-          const h = parseInt(etaMatch[1], 10);
-          const m = parseInt(etaMatch[2], 10);
-          const s = parseInt(etaMatch[3], 10);
-          job.etaSeconds = h * 3600 + m * 60 + s;
-          hasDirectEta = true;
-        } else {
-          const etaHMSSMatch = searchTarget.match(/~(\d+)h(\d+)m(\d+)s/i);
-          if (etaHMSSMatch) {
-            const h = parseInt(etaHMSSMatch[1], 10);
-            const m = parseInt(etaHMSSMatch[2], 10);
-            const s = parseInt(etaHMSSMatch[3], 10);
-            job.etaSeconds = h * 3600 + m * 60 + s;
-            hasDirectEta = true;
-          }
+          job.etaSeconds = parseInt(etaMatch[1], 10) * 3600 + parseInt(etaMatch[2], 10) * 60 + parseInt(etaMatch[3], 10);
         }
 
+        // Segment & progress tracking
         const trackMatch = cleanLine.match(/^(Vid|Aud|Sub)\*?\s*([^|]+)/i) || cleanLine.match(/(Vid|Aud|Sub)\*?\s*([\w\-]+)/i);
-
         if (trackMatch && segMatch) {
-          const type = trackMatch[1].toUpperCase();
-          const label = trackMatch[2].trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-          const key = `${type}_${label}`;
+          const key = `${trackMatch[1].toUpperCase()}_${trackMatch[2].trim().replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+          trackMap.set(key, { current: parseInt(segMatch[1], 10), total: parseInt(segMatch[2], 10), speedBps: job.currentSpeedBps });
 
-          const cur = parseInt(segMatch[1], 10);
-          const tot = parseInt(segMatch[2], 10);
-
-          trackMap.set(key, { current: cur, total: tot, speedBps: job.currentSpeedBps });
-
-          // Aggregate across all tracks in multi-stream download
           let sumCurrent = 0;
           let sumTotal = 0;
-
           for (const t of trackMap.values()) {
             sumCurrent += t.current;
             sumTotal += t.total;
           }
-
           if (sumTotal > 0) {
             job.currentSegment = sumCurrent;
             job.totalSegments = sumTotal;
-            const overallPct = Math.min(98, Math.round((sumCurrent / sumTotal) * 100));
-            job.progress = Math.max(job.progress, overallPct);
-          }
-
-          if (!hasDirectEta) {
-            const remainingSegs = Math.max(0, job.totalSegments - job.currentSegment);
-            if (job.currentSegment > 0 && job.elapsedSeconds > 0) {
-              const segsPerSec = job.currentSegment / job.elapsedSeconds;
-              if (segsPerSec > 0) {
-                job.etaSeconds = Math.round(remainingSegs / segsPerSec);
-              }
-            }
+            job.progress = Math.max(job.progress, Math.min(98, Math.round((sumCurrent / sumTotal) * 100)));
           }
         } else if (segMatch) {
-          // Fallback single-track line matcher
           const cur = parseInt(segMatch[1], 10);
           const tot = parseInt(segMatch[2], 10);
           job.currentSegment = Math.max(job.currentSegment, cur);
           job.totalSegments = Math.max(job.totalSegments, tot);
           if (tot > 0) {
-            const pct = Math.min(98, Math.round((cur / tot) * 100));
-            job.progress = Math.max(job.progress, pct);
+            job.progress = Math.max(job.progress, Math.min(98, Math.round((cur / tot) * 100)));
           }
-        }
-
-        if (job.progress > 0 && job.downloadedBytes > 0 && (job.totalBytes <= 0 || job.totalBytes < job.downloadedBytes)) {
-          job.totalBytes = Math.round(job.downloadedBytes / (job.progress / 100));
-        }
-
-        // State updated in memory. Paced SSE emissions are strictly handled once per second by the interval timer.
-        if (oldStatus !== job.status && (job.status === 'muxing' || oldStatus === 'muxing')) {
-          reportProgress();
         }
       };
 
@@ -1264,138 +733,93 @@ function runDownloadProcess(
           job.totalBytes = fileResult.bytes;
         }
 
+        const finalPath = path.join(DOWNLOADS_DIR, job.outputFile);
+        if (fs.existsSync(finalPath)) {
+          adjustFilePermissionsAndOwnership(finalPath);
+        }
+        adjustFilePermissionsAndOwnership(DOWNLOADS_DIR);
+
         if (code === 0) {
           job.status = 'completed';
           job.progress = 100;
           job.etaSeconds = 0;
           const sizeMb = (job.downloadedBytes / (1024 * 1024)).toFixed(1);
           addLog(job, 'info', `[SUCCESS] Download completed! Output file: /downloads/${job.outputFile} (${sizeMb} MB)`);
+          addLog(job, 'info', `[Permissions] Set world RW access & non-root ownership on /downloads/${job.outputFile}`);
         } else {
           job.status = 'failed';
           job.error = `Process exited with code ${code}`;
-          addLog(job, 'error', `[ERROR] Process exited with non-zero status code ${code}`);
+          addLog(job, 'error', `[ERROR] Process exited with code ${code}`);
         }
-        reportProgress(true);
+        notifyJobProgress(job, true);
       });
 
       child.on('error', (err) => {
         job.status = 'failed';
         job.error = err.message;
-        addLog(job, 'error', `[ERROR] Failed to launch binary process: ${err.message}`);
-        reportProgress(true);
+        addLog(job, 'error', `[ERROR] Binary execution failed: ${err.message}`);
+        notifyJobProgress(job, true);
       });
 
       return;
     } catch (spawnErr: any) {
       addLog(job, 'warn', `[Spawn Error] Could not launch native process: ${spawnErr.message}`);
-      reportProgress();
+      notifyJobProgress(job, true);
     }
   }
 
-  // Active Stream Runner Mode
-  addLog(
-    job,
-    'warn',
-    `[RE-Mux Note] Running active web runner stream pipeline for task ${jobId}...`
-  );
-  reportProgress();
-
-  let stepCounter = 0;
-  const totalSegs = Math.floor(Math.random() * 500) + 300;
+  // Web test/fallback runner (used when native N_m3u8DL-RE is absent)
+  addLog(job, 'info', `[RE-Mux Pipeline] Running simulated web runner for task ${jobId}...`);
+  let step = 0;
+  const totalSegs = 200;
   job.totalSegments = totalSegs;
-  job.totalBytes = Math.floor(totalSegs * 1.8 * 1024 * 1024);
+  job.totalBytes = 250 * 1024 * 1024;
 
   item.intervalTimer = setInterval(() => {
     if (job.status === 'paused' || job.status === 'completed' || job.status === 'failed') return;
-
-    stepCounter++;
+    step++;
 
     if (job.status === 'parsing') {
       job.status = 'downloading_video';
-      addLog(job, 'info', `[RE-Mux Engine] Downloading segments [0/${job.totalSegments}]...`);
-      reportProgress();
+      notifyJobProgress(job);
       return;
     }
 
     if (job.status.includes('downloading')) {
-      const segsToAdd = Math.floor(Math.random() * 20) + 12;
-      job.currentSegment = Math.min(job.totalSegments, job.currentSegment + segsToAdd);
+      job.currentSegment = Math.min(job.totalSegments, job.currentSegment + 20);
       job.progress = Math.round((job.currentSegment / job.totalSegments) * 88);
-
-      const baseSpeedMb = 24 + Math.sin(stepCounter * 0.4) * 6 + Math.random() * 3;
-      job.currentSpeedBps = Math.round(baseSpeedMb * 1024 * 1024);
-
-      job.speedHistory.push(job.currentSpeedBps);
-      if (job.speedHistory.length > 20) job.speedHistory.shift();
-
+      job.currentSpeedBps = 25 * 1024 * 1024;
       job.downloadedBytes = Math.round((job.currentSegment / job.totalSegments) * job.totalBytes);
       job.elapsedSeconds += 1;
-
-      const remainingBytes = job.totalBytes - job.downloadedBytes;
-      job.etaSeconds = Math.max(1, Math.round(remainingBytes / (job.currentSpeedBps || 1)));
-
-      if (stepCounter % 2 === 0 && job.currentSegment < job.totalSegments) {
-        addLog(
-          job,
-          'info',
-          `[N_m3u8DL-RE] Downloaded ${job.currentSegment}/${job.totalSegments} segments (${job.progress}%) - Speed: ${baseSpeedMb.toFixed(
-            1
-          )} MB/s - Thread pool active`
-        );
-      }
+      job.etaSeconds = Math.max(1, Math.round((job.totalBytes - job.downloadedBytes) / job.currentSpeedBps));
 
       if (job.currentSegment >= job.totalSegments) {
         job.status = 'muxing';
-        job.progress = 90;
-        addLog(job, 'info', `All stream segments fetched. Starting FFmpeg multi-track remuxer...`);
-        addLog(
-          job,
-          'muxer',
-          `[FFmpeg] Muxing video, multi-channel audio tracks, and subtitles into /downloads/${outputFilename}`
-        );
+        job.progress = 92;
+        addLog(job, 'muxer', `[FFmpeg] Muxing segments into /downloads/${outputFilename}`);
       }
-      reportProgress();
+      notifyJobProgress(job);
       return;
     }
 
     if (job.status === 'muxing') {
-      job.progress = Math.min(99, job.progress + 4);
-      job.currentSpeedBps = 0;
-
-      if (stepCounter % 2 === 0) {
-        addLog(
-          job,
-          'muxer',
-          `[FFmpeg] Writing container streams... [video/h264, audio/aac x${job.selectionsSummary.audio.length}, subs/vtt]`
-        );
+      job.progress = 100;
+      job.status = 'completed';
+      job.etaSeconds = 0;
+      const targetFile = path.join(DOWNLOADS_DIR, outputFilename);
+      if (!fs.existsSync(targetFile)) {
+        fs.writeFileSync(targetFile, `Stream downloaded result: ${job.title}\nJob ID: ${job.id}`);
       }
-
-      if (job.progress >= 99) {
-        job.status = 'completed';
-        job.progress = 100;
-        job.etaSeconds = 0;
-
-        const dummyPath = path.join(DOWNLOADS_DIR, outputFilename);
-        if (!fs.existsSync(dummyPath)) {
-          fs.writeFileSync(
-            dummyPath,
-            `RE-Mux Studio Download Result\nJob ID: ${job.id}\nURL: ${job.url}\nCommand: ${commandExecuted}\nCreated At: ${new Date().toISOString()}`
-          );
-        }
-
-        addLog(
-          job,
-          'info',
-          `[SUCCESS] Remux completed cleanly! Download available at: /api/download/file/${outputFilename}`
-        );
-        if (item.intervalTimer) clearInterval(item.intervalTimer);
-      }
-      reportProgress();
+      adjustFilePermissionsAndOwnership(targetFile);
+      adjustFilePermissionsAndOwnership(DOWNLOADS_DIR);
+      addLog(job, 'info', `[SUCCESS] Remux completed cleanly: /downloads/${outputFilename}`);
+      addLog(job, 'info', `[Permissions] Set world RW access & non-root ownership on /downloads/${outputFilename}`);
+      if (item.intervalTimer) clearInterval(item.intervalTimer);
+      notifyJobProgress(job, true);
     }
   }, 1000);
 }
 
-// Tokenizer supporting quoted strings
 function parseArgsFromCommandString(cmdStr: string, binaryName: string): string[] {
   let trimmed = cmdStr.trim();
   if (trimmed.startsWith(binaryName)) {
@@ -1440,6 +864,285 @@ function addLog(job: DownloadJob, level: LogMessage['level'], message: string) {
   };
   job.logs.push(log);
   if (job.logs.length > 80) job.logs.shift();
+}
+
+/* =========================================================================
+   EXPRESS HTTP SERVER & API ROUTES
+   ========================================================================= */
+async function startServer() {
+  const app = express();
+  const PORT = process.env.PORT || 3000;
+
+  app.use(express.json());
+
+  // Serve downloads directly
+  app.get('/downloads/:filename', (req: Request, res: Response) => {
+    const filename = path.basename(req.params.filename);
+    const filePath = path.join(DOWNLOADS_DIR, filename);
+
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      return res.download(filePath, filename);
+    }
+    return res.status(404).send('File not found in downloads.');
+  });
+  app.use('/downloads', express.static(DOWNLOADS_DIR));
+
+  // System status
+  app.get('/api/system-status', (_req: Request, res: Response) => {
+    return res.json({
+      hasNm3u8dl: HAS_NM3U8DL,
+      hasFfmpeg: HAS_FFMPEG,
+      downloadsDir: DOWNLOADS_DIR,
+      isDocker: fs.existsSync('/.dockerenv'),
+    });
+  });
+
+  // Browser extension compatibility endpoint
+  app.post('/api/auth/login', (req: Request, res: Response) => {
+    return res.json({ id: 1, username: req.body.username || 'user' });
+  });
+
+  // Stream Manifest Probe
+  app.post('/api/probe', async (req: Request, res: Response) => {
+    try {
+      const { url, headers, customTitle } = req.body;
+      if (!url || typeof url !== 'string' || !url.trim()) {
+        return res.status(400).json({ error: 'Valid Manifest URL is required' });
+      }
+
+      const customHeaders = parseHeaders(headers);
+      const analysis = await resolveStreamManifest(url.trim(), customHeaders, customTitle);
+      return res.json({ success: true, analysis });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Manifest analysis failed' });
+    }
+  });
+
+  // Start Download Job (from frontend UI)
+  app.post('/api/download/start', (req: Request, res: Response) => {
+    try {
+      const plan = buildDownloadJobPlan(req.body);
+      const job = createAndStartJob(plan);
+      return res.json({ success: true, job });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Failed to start download job' });
+    }
+  });
+
+  // Automated Task Endpoint (for browser extensions & probing automation)
+  app.post('/api/tasks', async (req: Request, res: Response) => {
+    try {
+      const url = req.body.url || req.body.stream_url || req.body.url_stream;
+      const outputName =
+        req.body.output_name ||
+        req.body.outputName ||
+        req.body.title ||
+        req.body.customTitle ||
+        'Stream Download';
+      const rawHeaders = req.body.headers || req.body.custom_headers || req.body.customHeaders;
+
+      if (!url || typeof url !== 'string' || !url.trim()) {
+        return res.status(400).json({ error: 'Valid stream URL is required in "url" field' });
+      }
+
+      const customHeaders = parseHeaders(rawHeaders);
+      const analysis = await resolveStreamManifest(url.trim(), customHeaders, outputName);
+      const plan = buildDownloadJobPlan({
+        url: url.trim(),
+        title: outputName,
+        analysis,
+        headers: customHeaders,
+      });
+
+      const job = createAndStartJob(plan);
+      return res.json({
+        success: true,
+        jobId: job.id,
+        job,
+        commandExecuted: plan.commandExecuted,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Failed to process task request' });
+    }
+  });
+
+  // Get active jobs list
+  app.get('/api/download/jobs', (_req: Request, res: Response) => {
+    const jobs = Array.from(activeJobsStore.values()).map((ij) => ij.job);
+    return res.json({ success: true, jobs });
+  });
+
+  // Global SSE Stream for UI updates
+  app.get('/api/download/events', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const sendAllJobs = () => {
+      if (res.writableEnded || res.closed) return;
+      const jobs = Array.from(activeJobsStore.values()).map((ij) => ij.job);
+      res.write(`data: ${JSON.stringify({ jobs })}\n\n`);
+    };
+
+    sendAllJobs();
+
+    const globalProgressLambda = () => sendAllJobs();
+    globalProgressListeners.add(globalProgressLambda);
+
+    // Keep-alive heartbeat every 15s (no state payload)
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded || res.closed) {
+        clearInterval(heartbeat);
+        return;
+      }
+      res.write(': keepalive\n\n');
+    }, 15000);
+
+    res.on('close', () => {
+      globalProgressListeners.delete(globalProgressLambda);
+      clearInterval(heartbeat);
+    });
+  });
+
+  // Per-job SSE Stream
+  app.get('/api/download/stream/:jobId', (req: Request, res: Response) => {
+    const { jobId } = req.params;
+    const item = activeJobsStore.get(jobId);
+
+    if (!item) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const sendJobUpdate = (updatedJob: DownloadJob) => {
+      if (res.writableEnded || res.closed) return;
+      res.write(`data: ${JSON.stringify({ job: updatedJob })}\n\n`);
+    };
+
+    sendJobUpdate(item.job);
+
+    if (!jobProgressListenerMap.has(jobId)) {
+      jobProgressListenerMap.set(jobId, new Set());
+    }
+    const jobListeners = jobProgressListenerMap.get(jobId)!;
+    jobListeners.add(sendJobUpdate);
+
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded || res.closed) {
+        clearInterval(heartbeat);
+        return;
+      }
+      res.write(': keepalive\n\n');
+    }, 15000);
+
+    res.on('close', () => {
+      jobListeners.delete(sendJobUpdate);
+      clearInterval(heartbeat);
+    });
+  });
+
+  // File Download API
+  app.get('/api/download/file/:filename', (req: Request, res: Response) => {
+    const filename = path.basename(req.params.filename);
+    const filePath = path.join(DOWNLOADS_DIR, filename);
+
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      return res.download(filePath, filename);
+    }
+    return res.status(404).send('File not found in downloads.');
+  });
+
+  // Job Pause / Resume / Cancel Control
+  app.post('/api/download/control', (req: Request, res: Response) => {
+    const { jobId, action } = req.body;
+    const item = activeJobsStore.get(jobId);
+
+    if (!item) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    if (action === 'cancel') {
+      if (item.process) {
+        try { item.process.kill('SIGINT'); } catch (e) {}
+      }
+      if (item.intervalTimer) clearInterval(item.intervalTimer);
+      item.job.status = 'failed';
+      item.job.error = 'Cancelled by user';
+      item.job.currentSpeedBps = 0;
+      addLog(item.job, 'error', '[Process] Execution terminated by user');
+      notifyJobProgress(item.job, true);
+    } else if (action === 'pause') {
+      item.job.status = 'paused';
+      item.job.currentSpeedBps = 0;
+      addLog(item.job, 'warn', '[Process] Download task paused by user');
+      notifyJobProgress(item.job, true);
+    } else if (action === 'resume') {
+      item.job.status = 'downloading_video';
+      addLog(item.job, 'info', '[Process] Download task resumed');
+      notifyJobProgress(item.job, true);
+    }
+
+    return res.json({ success: true, job: item.job });
+  });
+
+  // HLS/DASH proxy
+  app.get('/api/proxy', async (req: Request, res: Response) => {
+    const targetUrl = req.query.url as string;
+    if (!targetUrl) return res.status(400).send('URL query parameter required');
+
+    try {
+      const response = await fetch(targetUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Accept: '*/*',
+        },
+      });
+      if (!response.ok) {
+        return res.status(response.status).send(`Proxy error: ${response.statusText}`);
+      }
+      res.setHeader('Content-Type', response.headers.get('content-type') || 'text/plain');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      const bodyBuffer = await response.arrayBuffer();
+      return res.send(Buffer.from(bodyBuffer));
+    } catch (err: any) {
+      return res.status(500).send(`Proxy error: ${err.message}`);
+    }
+  });
+
+  // Vite development middleware or static production serve
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'custom',
+    });
+    app.use(vite.middlewares);
+    app.use('*', async (req, res, next) => {
+      try {
+        const url = req.originalUrl;
+        let template = await fs.promises.readFile(path.resolve('./index.html'), 'utf-8');
+        template = await vite.transformIndexHtml(url, template);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
+  } else {
+    app.use(express.static(path.resolve('./dist')));
+    app.use('*', (_req, res) => {
+      res.sendFile(path.resolve('./dist/index.html'));
+    });
+  }
+
+  app.listen(PORT, () => {
+    console.log(`RE-Mux Studio server active on http://localhost:${PORT}`);
+  });
 }
 
 startServer();

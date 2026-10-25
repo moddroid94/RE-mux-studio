@@ -13,7 +13,9 @@ import {
   Preset,
   StreamSelections,
 } from './types/stream';
-import { generateNm3u8dlCommand } from './utils/commandGenerator';
+import {
+  buildDownloadJobPlan
+} from './utils/commandGenerator';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<
@@ -37,15 +39,15 @@ export default function App() {
   const [commandConfig, setCommandConfig] = useState<CommandConfig>({
     binaryPath: 'N_m3u8DL-RE',
     outputDir: './downloads',
-    outputName: 'HLS_stream',
+    outputName: '{title}_{res}_{lang}',
     muxer: 'ffmpeg',
-    containerFormat: 'mp4',
+    containerFormat: 'mkv',
     threadCount: 8,
     concurrentDownload: 5,
     maxSpeed: '0',
     retryCount: 3,
-    checkSegmentsCount: false,
-    autoSelect: false,
+    checkSegmentsCount: true,
+    autoSelect: true,
     keepTsFiles: false,
     useShakaPackager: false,
     shakaPackagerPath: '',
@@ -113,40 +115,19 @@ export default function App() {
   const handleStartDownload = async () => {
     if (!analysis) return;
 
-    const commandExecuted = generateNm3u8dlCommand(
+    const plan = buildDownloadJobPlan({
+      url: analysis.url,
+      title: analysis.title,
       analysis,
       selections,
-      commandConfig
-    );
-
-    const selectedAudioLangs = analysis.audioTracks
-      .filter((a) => selections.selectedAudioIds.includes(a.id))
-      .map((a) => `${a.language.toUpperCase()} (${a.channels})`);
-
-    const selectedSubLangs = analysis.subtitleTracks
-      .filter((s) => selections.selectedSubtitleIds.includes(s.id))
-      .map((s) => s.language.toUpperCase());
-
-    const videoName = selections.autoBestVideo
-      ? 'Best Video (1080p+)'
-      : analysis.videoTracks.find((v) => v.id === selections.selectedVideoId)
-          ?.resolution || '1080p';
+      config: commandConfig,
+    });
 
     try {
       const res = await fetch('/api/download/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: analysis.url,
-          title: analysis.title,
-          commandExecuted,
-          commandConfig,
-          selectionsSummary: {
-            video: videoName,
-            audio: selectedAudioLangs.length ? selectedAudioLangs : ['Default'],
-            subtitles: selectedSubLangs.length ? selectedSubLangs : ['None'],
-          },
-        }),
+        body: JSON.stringify(plan),
       });
 
       const data = await res.json();

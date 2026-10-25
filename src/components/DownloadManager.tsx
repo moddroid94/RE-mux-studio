@@ -9,7 +9,6 @@ import {
   Download,
   FileVideo,
   Gauge,
-  Info,
   Layers,
   Link,
   Pause,
@@ -274,24 +273,6 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
                       className="px-3 py-1.5 text-xs font-bold text-cyan-400 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg flex items-center gap-1.5"
                     >
                       <Terminal className="w-3.5 h-3.5" /> Terminal Logs
-                    </button>
-
-                    <button
-                      onClick={() => toggleJobDetails(job.id)}
-                      className={`px-3 py-1.5 text-xs font-bold border rounded-lg flex items-center gap-1.5 transition-colors ${
-                        expandedJobIds[job.id]
-                          ? 'text-cyan-300 bg-cyan-950/60 border-cyan-600/70'
-                          : 'text-slate-300 bg-slate-800 hover:bg-slate-700 border-slate-700'
-                      }`}
-                      title="Toggle detailed task info & command"
-                    >
-                      <Info className="w-3.5 h-3.5 text-cyan-400" />
-                      <span>Details</span>
-                      {expandedJobIds[job.id] ? (
-                        <ChevronUp className="w-3.5 h-3.5 text-cyan-400" />
-                      ) : (
-                        <ChevronDown className="w-3.5 h-3.5" />
-                      )}
                     </button>
 
                     {job.status === 'completed' && (

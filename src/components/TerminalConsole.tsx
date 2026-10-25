@@ -29,24 +29,12 @@ export const TerminalConsole: React.FC<TerminalConsoleProps> = ({
 
   const lastLogId = job?.logs[job.logs.length - 1]?.id;
 
-  // Auto-scroll to bottom only when new log arrives AND user is at the bottom
+  // Scroll to bottom on mount and when new logs arrive (if at bottom)
   useEffect(() => {
     if (logContainerRef.current && isAtBottomRef.current) {
-      const el = logContainerRef.current;
-      requestAnimationFrame(() => {
-        if (isAtBottomRef.current && el) {
-          el.scrollTop = el.scrollHeight;
-        }
-      });
-    }
-  }, [lastLogId]);
-
-  // Initial scroll to bottom on mount
-  useEffect(() => {
-    if (logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
-  }, []);
+  }, [lastLogId]);
 
   const handleScroll = () => {
     if (logContainerRef.current) {

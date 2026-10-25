@@ -1,9 +1,98 @@
 import {
   CommandConfig,
+  CustomHeader,
   ManifestAnalysis,
-  StreamSelections
+  StreamSelections,
 } from '../types/stream';
 
+export const DEFAULT_COMMAND_CONFIG: CommandConfig = {
+  binaryPath: 'N_m3u8DL-RE',
+  outputDir: './downloads',
+  outputName: '{title}',
+  muxer: 'ffmpeg',
+  containerFormat: 'mp4',
+  threadCount: 8,
+  concurrentDownload: 5,
+  maxSpeed: '0',
+  retryCount: 3,
+  checkSegmentsCount: true,
+  autoSelect: true,
+  keepTsFiles: false,
+  useShakaPackager: false,
+  shakaPackagerPath: '',
+  keys: [],
+  headers: [],
+  proxy: '',
+  customRawFlags: '',
+  customFfmpegFlags: '',
+};
+
+export const DEFAULT_STREAM_SELECTIONS: StreamSelections = {
+  selectedVideoId: 'best',
+  selectedAudioIds: [],
+  selectedSubtitleIds: [],
+  autoBestVideo: true,
+  autoAllAudio: true,
+  autoAllSubtitles: true,
+};
+
+/**
+ * Universal header parser supporting raw string ('Key: Value'), array, or key-value object.
+ */
+export function parseHeaders(input: any): CustomHeader[] {
+  if (!input) return [];
+  const results: CustomHeader[] = [];
+
+  const addHeader = (k: string, v: string) => {
+    const key = k.trim();
+    const value = v.trim();
+    if (key && value) {
+      results.push({ id: `h_${results.length + 1}`, key, value });
+    }
+  };
+
+  if (typeof input === 'string') {
+    input.split(/\r?\n/).forEach((line) => {
+      const idx = line.indexOf(':');
+      if (idx > 0) {
+        addHeader(line.substring(0, idx), line.substring(idx + 1));
+      }
+    });
+  } else if (Array.isArray(input)) {
+    input.forEach((item) => {
+      if (typeof item === 'string') {
+        const idx = item.indexOf(':');
+        if (idx > 0) addHeader(item.substring(0, idx), item.substring(idx + 1));
+      } else if (item && typeof item === 'object') {
+        const k = item.key || item.name || item.header;
+        const v = item.value || item.val;
+        if (k && v) addHeader(String(k), String(v));
+      }
+    });
+  } else if (typeof input === 'object' && input !== null) {
+    for (const [k, v] of Object.entries(input)) {
+      if (k && v) addHeader(k, String(v));
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Sanitizes a title string into a filesystem-safe base name.
+ */
+export function sanitizeSaveName(title?: string): string {
+  const clean = (title || 'Stream')
+    .replace(/[/\\?%*:|"<>']/g, '_')
+    .trim()
+    .replace(/[\s]+/g, '_')
+    .replace(/_+/g, '_');
+  return clean || 'Stream';
+}
+
+/**
+ * Generates an N_m3u8DL-RE CLI command from analysis, selections, and config.
+ */
 export function generateNm3u8dlCommand(
   analysis: ManifestAnalysis,
   selections: StreamSelections,
@@ -15,7 +104,7 @@ export function generateNm3u8dlCommand(
   const binary = config.binaryPath || 'N_m3u8DL-RE';
   parts.push(binary);
 
-  // 2. Stream URL (quoted)
+  // 2. Stream URL
   parts.push(`"${analysis.url}"`);
 
   // 3. Video Selection Flag
@@ -27,14 +116,10 @@ export function generateNm3u8dlCommand(
     const videoTrack = analysis.videoTracks.find(
       (v) => v.id === selections.selectedVideoId
     );
-    if (videoTrack) {
-      if (videoTrack.height > 0) {
-        parts.push(`--select-video "res=${videoTrack.height}*"`);
-      } else if (videoTrack.resolution) {
-        parts.push(`--select-video "res=${videoTrack.resolution}"`);
-      } else {
-        parts.push(`--select-video "id=${videoTrack.id}"`);
-      }
+    if (videoTrack?.height) {
+      parts.push(`--select-video "res=${videoTrack.height}*"`);
+    } else if (videoTrack?.resolution) {
+      parts.push(`--select-video "res=${videoTrack.resolution}"`);
     } else {
       parts.push(`--select-video "id=${selections.selectedVideoId}"`);
     }
@@ -49,16 +134,11 @@ export function generateNm3u8dlCommand(
     const selectedAudios = analysis.audioTracks.filter((a) =>
       selections.selectedAudioIds.includes(a.id)
     );
-    if (selectedAudios.length > 0) {
-      const langs = Array.from(
-        new Set(selectedAudios.map((a) => a.language).filter(Boolean))
-      );
-      if (langs.length > 0) {
-        const langPattern = langs.join('|');
-        parts.push(`--select-audio "lang=${langPattern}"`);
-      } else {
-        parts.push(`-sa all`);
-      }
+    const langs = Array.from(
+      new Set(selectedAudios.map((a) => a.language).filter(Boolean))
+    );
+    if (langs.length > 0) {
+      parts.push(`--select-audio "lang=${langs.join('|')}"`);
     } else {
       parts.push(`-sa all`);
     }
@@ -73,29 +153,21 @@ export function generateNm3u8dlCommand(
     const selectedSubs = analysis.subtitleTracks.filter((s) =>
       selections.selectedSubtitleIds.includes(s.id)
     );
-    if (selectedSubs.length > 0) {
-      const langs = Array.from(
-        new Set(selectedSubs.map((s) => s.language).filter(Boolean))
-      );
-      if (langs.length > 0) {
-        const langPattern = langs.join('|');
-        parts.push(`--select-subtitle "lang=${langPattern}"`);
-      } else {
-        parts.push(``);
-      }
+    const langs = Array.from(
+      new Set(selectedSubs.map((s) => s.language).filter(Boolean))
+    );
+    if (langs.length > 0) {
+      parts.push(`--select-subtitle "lang=${langs.join('|')}"`);
     }
-  } else {
-    parts.push(``);
   }
 
   // 6. Muxing Configuration
   if (config.muxer !== 'none') {
-    const format = config.containerFormat || 'mkv';
-    const muxerName = config.muxer || 'ffmpeg';
+    const format = config.containerFormat || 'mp4';
     parts.push(`-M format=${format}`);
   }
 
-  // 7. Performance & Threads
+  // 7. Performance & Thread Flags
   if (config.threadCount && config.threadCount > 1) {
     parts.push(`--thread-count ${config.threadCount}`);
   }
@@ -106,53 +178,12 @@ export function generateNm3u8dlCommand(
     parts.push(`--max-speed ${config.maxSpeed}`);
   }
 
-  // 8. Output Directory & Name
+  // 8. Output Directory & Safe Save Name
   if (config.outputDir) {
     parts.push(`--save-dir "${config.outputDir}"`);
   }
 
-  // Base title sanitized
-  let baseTitle = (config.outputName || analysis.title || 'Stream')
-    .replace(/\{title\}/gi, analysis.title || 'Stream')
-    .replace(/\{res\}/gi, '1080p')
-    .replace(/\{lang\}/gi, 'multi')
-    .replace(/[{}]/g, '')
-    .replace(/[^a-zA-Z0-9_-]/g, '_');
-
-  if (!baseTitle) baseTitle = 'Stream';
-
-  // Extract selected video height/res tag
-  let resTag = '';
-  if (selections.selectedVideoId && selections.selectedVideoId !== 'best' && selections.selectedVideoId !== 'worst') {
-    const vTrack = analysis.videoTracks.find((v) => v.id === selections.selectedVideoId);
-    if (vTrack?.height) {
-      resTag = `_${vTrack.height}p`;
-    } else if (vTrack?.resolution) {
-      resTag = `_${vTrack.resolution}`;
-    }
-  }
-
-  // Extract selected audio languages tag
-  const selectedAudios = analysis.audioTracks.filter((a) =>
-    selections.selectedAudioIds.includes(a.id)
-  );
-  let audioLangs = Array.from(new Set(selectedAudios.map((a) => a.language).filter(Boolean)));
-  if (audioLangs.length === 0 && selections.autoAllAudio && analysis.audioTracks.length > 0) {
-    audioLangs = Array.from(new Set(analysis.audioTracks.map((a) => a.language).filter(Boolean)));
-  }
-  const audioTag = audioLangs.length > 0 ? `_audio-${audioLangs.join('-')}` : '';
-
-  // Extract selected subtitle languages tag
-  const selectedSubs = analysis.subtitleTracks.filter((s) =>
-    selections.selectedSubtitleIds.includes(s.id)
-  );
-  let subLangs = Array.from(new Set(selectedSubs.map((s) => s.language).filter(Boolean)));
-  if (subLangs.length === 0 && selections.autoAllSubtitles && analysis.subtitleTracks.length > 0) {
-    subLangs = Array.from(new Set(analysis.subtitleTracks.map((s) => s.language).filter(Boolean)));
-  }
-  const subTag = subLangs.length > 0 ? `_subs-${subLangs.join('-')}` : '';
-
-  const finalSaveName = `${baseTitle}${resTag}${audioTag}${subTag}`.replace(/_+/g, '_');
+  const finalSaveName = sanitizeSaveName(config.outputName || analysis.title);
   parts.push(`--save-name "${finalSaveName}"`);
 
   // 9. DRM Decryption Keys
@@ -182,7 +213,6 @@ export function generateNm3u8dlCommand(
   if (config.checkSegmentsCount) {
     parts.push(`--check-segments-count true`);
   }
-
   if (config.keepTsFiles) {
     parts.push(`--keep-ts-files`);
   }
@@ -196,17 +226,149 @@ export function generateNm3u8dlCommand(
     }
   }
 
-  // 14. Custom FFmpeg additional flags
+  // 14. Custom Flags
   if (config.customFfmpegFlags) {
     parts.push(`--mux-import bin_path="ffmpeg":args="${config.customFfmpegFlags}"`);
   }
-
-  // 15. Custom Raw Extra Flags
   if (config.customRawFlags) {
     parts.push(config.customRawFlags.trim());
   }
 
-  return parts.join(' ');
+  return parts.filter(Boolean).join(' ');
+}
+
+export interface DownloadJobPlan {
+  url: string;
+  title: string;
+  saveName: string;
+  outputFile: string;
+  commandExecuted: string;
+  selectionsSummary: {
+    video: string;
+    audio: string[];
+    subtitles: string[];
+  };
+  config: CommandConfig;
+  selections: StreamSelections;
+}
+
+/**
+ * Unified plan builder used by both UI download start and API automated tasks.
+ * Single source of truth for command flags, output filenames, and track summaries.
+ */
+export function buildDownloadJobPlan(params: {
+  url: string;
+  title?: string;
+  analysis?: ManifestAnalysis | null;
+  selections?: Partial<StreamSelections>;
+  config?: Partial<CommandConfig>;
+  headers?: any;
+  explicitCommand?: string;
+  explicitSelectionsSummary?: { video: string; audio: string[]; subtitles: string[] };
+}): DownloadJobPlan {
+  const url = params.url.trim();
+  const title = params.title || params.analysis?.title || 'Stream';
+  const saveName = sanitizeSaveName(title);
+
+  // Merge headers into config
+  const customHeaders = parseHeaders(params.headers || params.config?.headers);
+  const config: CommandConfig = {
+    ...DEFAULT_COMMAND_CONFIG,
+    ...params.config,
+    outputName: saveName,
+    headers: customHeaders,
+  };
+
+  const containerFormat = config.containerFormat || 'mp4';
+  const outputFile = `${saveName}.${containerFormat}`;
+
+  // Build or infer stream selections
+  const selections: StreamSelections = {
+    ...DEFAULT_STREAM_SELECTIONS,
+    ...params.selections,
+  };
+
+  const analysis: ManifestAnalysis = params.analysis || {
+    url,
+    type: 'HLS (m3u8)',
+    title,
+    videoTracks: [],
+    audioTracks: [],
+    subtitleTracks: [],
+  };
+
+  // Subtitle auto-selection logic: if manifest has subtitles and no explicit subtitle list provided,
+  // select both English and Italian if both exist, or the single present one, or none.
+  if (
+    (!params.selections || !params.selections.selectedSubtitleIds || params.selections.selectedSubtitleIds.length === 0) &&
+    analysis.subtitleTracks.length > 0
+  ) {
+    const subLangs = analysis.subtitleTracks.map((s) => (s.language || s.name || '').toLowerCase());
+    const hasEng = subLangs.some((s) => s === 'en' || s.includes('eng') || s.includes('english'));
+    const hasIta = subLangs.some((s) => s === 'it' || s.includes('ita') || s.includes('italian'));
+
+    if (hasEng || hasIta) {
+      selections.autoAllSubtitles = false;
+      const matchedSubs = analysis.subtitleTracks.filter((s) => {
+        const l = (s.language || s.name || '').toLowerCase();
+        const isE = l === 'en' || l.includes('eng') || l.includes('english');
+        const isI = l === 'it' || l.includes('ita') || l.includes('italian');
+        return (hasEng && isE) || (hasIta && isI);
+      });
+      selections.selectedSubtitleIds = matchedSubs.map((s) => s.id);
+    } else {
+      selections.autoAllSubtitles = false;
+      selections.selectedSubtitleIds = [];
+    }
+  }
+
+  // Generate command string if not explicitly passed
+  const commandExecuted = params.explicitCommand || generateNm3u8dlCommand(analysis, selections, config);
+
+  // Compute selections summary
+  let selectionsSummary = params.explicitSelectionsSummary;
+  if (!selectionsSummary) {
+    const videoSummary = selections.autoBestVideo
+      ? 'Best Video Quality'
+      : analysis.videoTracks.find((v) => v.id === selections.selectedVideoId)?.resolution || 'Best Video Quality';
+
+    const selectedAudioTracks = analysis.audioTracks.filter((a) =>
+      selections.selectedAudioIds.includes(a.id)
+    );
+    const audioSummary =
+      selectedAudioTracks.length > 0
+        ? selectedAudioTracks.map((a) => a.languageName || a.language || a.name)
+        : selections.autoAllAudio
+        ? (analysis.audioTracks.length > 0 ? analysis.audioTracks.map((a) => a.languageName || a.language || a.name) : ['All Audio Tracks'])
+        : ['Default Audio'];
+
+    const selectedSubTracks = analysis.subtitleTracks.filter((s) =>
+      selections.selectedSubtitleIds.includes(s.id)
+    );
+    const subSummary =
+      selectedSubTracks.length > 0
+        ? selectedSubTracks.map((s) => s.languageName || s.language || s.name)
+        : selections.autoAllSubtitles
+        ? ['All Subtitles']
+        : ['None'];
+
+    selectionsSummary = {
+      video: videoSummary,
+      audio: audioSummary,
+      subtitles: subSummary,
+    };
+  }
+
+  return {
+    url,
+    title,
+    saveName,
+    outputFile,
+    commandExecuted,
+    selectionsSummary,
+    config,
+    selections,
+  };
 }
 
 export function generateFFmpegStandaloneCommand(
