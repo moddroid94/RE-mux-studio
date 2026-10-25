@@ -113,15 +113,45 @@ export function generateNm3u8dlCommand(
   } else if (selections.selectedVideoId === 'worst') {
     parts.push(`-sv worst`);
   } else if (selections.selectedVideoId) {
+    const selected = selections.selectedVideoId;
     const videoTrack = analysis.videoTracks.find(
-      (v) => v.id === selections.selectedVideoId
+      (v) =>
+        v.id === selected ||
+        v.resolution === selected ||
+        (v.height && `${v.height}` === selected) ||
+        (v.height && `${v.height}p` === selected)
     );
-    if (videoTrack?.height) {
-      parts.push(`--select-video "res=${videoTrack.height}*"`);
-    } else if (videoTrack?.resolution) {
-      parts.push(`--select-video "res=${videoTrack.resolution}"`);
+
+    let resPattern = '';
+
+    if (videoTrack) {
+      if (videoTrack.resolution && videoTrack.resolution.includes('x')) {
+        resPattern = videoTrack.resolution.trim();
+      } else if (videoTrack.width && videoTrack.height) {
+        resPattern = `${videoTrack.width}x${videoTrack.height}`;
+      } else if (videoTrack.height) {
+        resPattern = `${videoTrack.height}`;
+      } else if (videoTrack.resolution) {
+        resPattern = videoTrack.resolution.trim();
+      }
+    }
+
+    if (!resPattern && selected) {
+      const matchX = selected.match(/\d+x\d+/);
+      if (matchX) {
+        resPattern = matchX[0];
+      } else {
+        const numMatch = selected.match(/\d{3,4}/);
+        if (numMatch) {
+          resPattern = numMatch[0];
+        }
+      }
+    }
+
+    if (resPattern) {
+      parts.push(`-sv "res=${resPattern}"`);
     } else {
-      parts.push(`--select-video "id=${selections.selectedVideoId}"`);
+      parts.push(`-sv best`);
     }
   } else {
     parts.push(`-sv best`);
@@ -330,7 +360,11 @@ export function buildDownloadJobPlan(params: {
   if (!selectionsSummary) {
     const videoSummary = selections.autoBestVideo
       ? 'Best Video Quality'
-      : analysis.videoTracks.find((v) => v.id === selections.selectedVideoId)?.resolution || 'Best Video Quality';
+      : (analysis.videoTracks.find((v) =>
+          v.id === selections.selectedVideoId ||
+          v.resolution === selections.selectedVideoId ||
+          (v.height && `${v.height}p` === selections.selectedVideoId)
+        )?.resolution || selections.selectedVideoId || 'Best Video Quality');
 
     const selectedAudioTracks = analysis.audioTracks.filter((a) =>
       selections.selectedAudioIds.includes(a.id)

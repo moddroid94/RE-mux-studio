@@ -113,7 +113,7 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
       if (data.success && data.analysis) {
         setAnalysis(data.analysis);
 
-        const defaultVideo = data.analysis.videoTracks[0]?.id || 'best';
+        const defaultVideo = data.analysis.videoTracks[0]?.resolution || 'best';
         const defaultAudios = data.analysis.audioTracks.map((a: any) => a.id);
         const defaultSubs = data.analysis.subtitleTracks.map((s: any) => s.id);
 
@@ -136,7 +136,7 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
   const handlePresetSelectAll = () => {
     if (!analysis) return;
     setSelections({
-      selectedVideoId: analysis.videoTracks[0]?.id || 'best',
+      selectedVideoId: analysis.videoTracks[0]?.resolution || 'best',
       selectedAudioIds: analysis.audioTracks.map((a) => a.id),
       selectedSubtitleIds: analysis.subtitleTracks.map((s) => s.id),
       autoBestVideo: true,
@@ -170,7 +170,7 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
       analysis.audioTracks[0]?.id;
     const defaultSub = analysis.subtitleTracks.find((s) => s.isDefault)?.id;
     setSelections({
-      selectedVideoId: analysis.videoTracks[0]?.id || 'best',
+      selectedVideoId: analysis.videoTracks[0]?.resolution || 'best',
       selectedAudioIds: defaultAudio ? [defaultAudio] : [],
       selectedSubtitleIds: defaultSub ? [defaultSub] : [],
       autoBestVideo: false,
@@ -666,7 +666,7 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
                   className="rounded border-slate-700 bg-slate-950 text-cyan-500 focus:ring-cyan-500"
                 />
                 <span className="font-semibold">
-                  Auto Select Best Video (--select-video for=best)
+                  Auto Select Best Video (-sv best)
                 </span>
               </label>
             </div>
@@ -685,17 +685,22 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 bg-slate-900/50">
-                  {analysis.videoTracks.map((v) => {
-                    const isSelected =
-                      selections.autoBestVideo ||
-                      selections.selectedVideoId === v.id;
+                  {analysis.videoTracks.map((v, idx) => {
+                    const isSelected = Boolean(
+                      selections.autoBestVideo
+                        ? v.isDefault || idx === 0
+                        : selections.selectedVideoId === v.resolution ||
+                            selections.selectedVideoId === v.id ||
+                            (v.height && `${v.height}p` === selections.selectedVideoId) ||
+                            (v.height && `${v.height}` === selections.selectedVideoId)
+                    );
                     return (
                       <tr
                         key={v.id}
                         onClick={() =>
                           setSelections((prev) => ({
                             ...prev,
-                            selectedVideoId: v.id,
+                            selectedVideoId: v.resolution || (v.height ? `${v.height}p` : v.id),
                             autoBestVideo: false,
                           }))
                         }
@@ -716,11 +721,15 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
                         </td>
                         <td className="py-3 px-4 font-bold text-cyan-300">
                           {v.resolution}
-                          {v.isDefault && (
+                          {selections.autoBestVideo && (v.isDefault || idx === 0) ? (
                             <span className="ml-2 px-1.5 py-0.2 text-[10px] bg-cyan-500/20 text-cyan-400 rounded">
+                              AUTO (BEST)
+                            </span>
+                          ) : v.isDefault ? (
+                            <span className="ml-2 px-1.5 py-0.2 text-[10px] bg-slate-800 text-slate-400 rounded">
                               DEFAULT
                             </span>
-                          )}
+                          ) : null}
                         </td>
                         <td className="py-3 px-4 text-slate-200">
                           {v.bitrateFormatted}
