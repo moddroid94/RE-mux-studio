@@ -670,7 +670,7 @@ function runDownloadProcess(
       };
       const fullCmdString = `${binaryToUse} ${rawArgs.map(esc).join(' ')}`;
       spawnCmd = 'script';
-      spawnArgs = ['-q', '-c', fullCmdString, '/dev/null'];
+      spawnArgs = ['-q', '-c', `stty cols 300 rows 60 2>/dev/null; ${fullCmdString}`, '/dev/null'];
     }
 
     try {
