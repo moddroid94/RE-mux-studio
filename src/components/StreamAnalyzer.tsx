@@ -1,4 +1,5 @@
 import {
+  Bookmark,
   Check,
   CheckCircle2,
   Copy,
@@ -23,6 +24,7 @@ import React, { useEffect, useState } from 'react';
 import {
   CommandConfig,
   ManifestAnalysis,
+  Preset,
   StreamSelections,
 } from '../types/stream';
 import {
@@ -39,9 +41,13 @@ interface StreamAnalyzerProps {
   setSelections: React.Dispatch<React.SetStateAction<StreamSelections>>;
   commandConfig: CommandConfig;
   setCommandConfig: React.Dispatch<React.SetStateAction<CommandConfig>>;
+  presets: Preset[];
+  selectedPresetId: string;
+  onSelectPreset: (presetId: string) => void;
   onStartDownload: () => void;
   onPreviewInPlayer: () => void;
   onGoToBuilder: () => void;
+  onGoToPresets: () => void;
 }
 
 export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
@@ -53,9 +59,13 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
   setSelections,
   commandConfig,
   setCommandConfig,
+  presets,
+  selectedPresetId,
+  onSelectPreset,
   onStartDownload,
   onPreviewInPlayer,
   onGoToBuilder,
+  onGoToPresets,
 }) => {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [showAdvancedHeaders, setShowAdvancedHeaders] = useState(false);
@@ -284,7 +294,7 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
 
       {/* Search Input Bar */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
           <div>
             <h2 className="text-xl font-bold text-white flex items-center gap-2">
               <Film className="w-5 h-5 text-cyan-400" />
@@ -295,30 +305,49 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
             </p>
           </div>
 
-          {/* History Selector Dropdown */}
-          {historyUrls.length > 0 && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-semibold text-slate-400 whitespace-nowrap flex items-center gap-1">
-                <History className="w-3.5 h-3.5 text-cyan-400" /> Recent URLs:
-              </span>
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Main Preset Selector Dropdown */}
+            <div className="flex items-center gap-2 bg-slate-950 px-3 py-1.5 rounded-xl border border-purple-500/40 shadow-sm">
+              <Bookmark className="w-4 h-4 text-purple-400 shrink-0" />
+              <span className="text-xs font-bold text-slate-300 whitespace-nowrap">Preset:</span>
               <select
-                onChange={(e) => {
-                  if (e.target.value) {
-                    setStreamUrl(e.target.value);
-                    handleAnalyze(e.target.value);
-                  }
-                }}
-                className="px-3 py-1.5 text-xs font-mono bg-slate-950 border border-slate-700 rounded-lg text-slate-200 focus:outline-none focus:border-cyan-500 transition-colors max-w-xs truncate"
+                value={selectedPresetId}
+                onChange={(e) => onSelectPreset(e.target.value)}
+                className="bg-transparent text-xs font-bold text-purple-300 focus:outline-none cursor-pointer max-w-[210px] truncate"
               >
-                <option value="">Select recent URL...</option>
-                {historyUrls.map((u, idx) => (
-                  <option key={idx} value={u}>
-                    {u.length > 45 ? u.substring(0, 45) + '...' : u}
+                {presets.map((p) => (
+                  <option key={p.id} value={p.id} className="bg-slate-950 text-white font-mono">
+                    {p.name}
                   </option>
                 ))}
               </select>
             </div>
-          )}
+
+            {/* History Selector Dropdown */}
+            {historyUrls.length > 0 && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold text-slate-400 whitespace-nowrap flex items-center gap-1">
+                  <History className="w-3.5 h-3.5 text-cyan-400" /> Recent:
+                </span>
+                <select
+                  onChange={(e) => {
+                    if (e.target.value) {
+                      setStreamUrl(e.target.value);
+                      handleAnalyze(e.target.value);
+                    }
+                  }}
+                  className="px-3 py-1.5 text-xs font-mono bg-slate-950 border border-slate-700 rounded-lg text-slate-200 focus:outline-none focus:border-cyan-500 transition-colors max-w-xs truncate"
+                >
+                  <option value="">Recent URLs...</option>
+                  {historyUrls.map((u, idx) => (
+                    <option key={idx} value={u}>
+                      {u.length > 40 ? u.substring(0, 40) + '...' : u}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Main Search Input Form & Title Row */}
@@ -931,12 +960,31 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
             </div>
 
             <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
+              {/* Preset Selector Dropdown in Action Footer */}
+              <div className="flex items-center gap-2 bg-slate-950 px-3 py-2 rounded-xl border border-purple-500/40">
+                <Bookmark className="w-4 h-4 text-purple-400 shrink-0" />
+                <div className="flex flex-col">
+                  <span className="text-[9px] uppercase font-bold text-slate-400 leading-none">Preset</span>
+                  <select
+                    value={selectedPresetId}
+                    onChange={(e) => onSelectPreset(e.target.value)}
+                    className="bg-transparent text-xs font-bold text-purple-300 focus:outline-none cursor-pointer max-w-[190px] truncate mt-0.5"
+                  >
+                    {presets.map((p) => (
+                      <option key={p.id} value={p.id} className="bg-slate-950 text-white font-mono">
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
               <button
                 onClick={onPreviewInPlayer}
                 className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl transition-all"
               >
                 <Play className="w-4 h-4 text-emerald-400" />
-                <span>Test in Player</span>
+                <span>Test Player</span>
               </button>
 
               <button
@@ -944,7 +992,7 @@ export const StreamAnalyzer: React.FC<StreamAnalyzerProps> = ({
                 className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl transition-all"
               >
                 <Terminal className="w-4 h-4 text-amber-400" />
-                <span>Customize Flags</span>
+                <span>Command Editor</span>
               </button>
 
               <button

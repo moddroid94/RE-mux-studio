@@ -1,5 +1,5 @@
+import { Bookmark, Download, Film, Play, Plus, Terminal } from 'lucide-react';
 import React from 'react';
-import { Film, Terminal, Download, Play, Bookmark, Plus } from 'lucide-react';
 
 interface NavbarProps {
   activeTab: 'analyzer' | 'player' | 'builder' | 'queue' | 'history';
@@ -66,7 +66,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           }`}
         >
           <Terminal className="w-4 h-4 text-amber-400" />
-          <span>Command Builder</span>
+          <span>Command Editor</span>
         </button>
 
         <button
@@ -95,7 +95,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           }`}
         >
           <Bookmark className="w-4 h-4 text-purple-400" />
-          <span>Presets & History</span>
+          <span>Presets & Settings</span>
         </button>
       </nav>
 

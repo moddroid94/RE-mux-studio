@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { CommandBuilder } from './components/CommandBuilder';
 import { DownloadManager } from './components/DownloadManager';
 import { Navbar } from './components/Navbar';
@@ -14,8 +14,16 @@ import {
   StreamSelections,
 } from './types/stream';
 import {
-  buildDownloadJobPlan
+  buildDownloadJobPlan,
 } from './utils/commandGenerator';
+import {
+  getSavedSelectedPresetId,
+  loadSavedCommandConfig,
+  loadSavedPresets,
+  saveCommandConfig,
+  savePresets,
+  saveSelectedPresetId,
+} from './utils/presetStorage';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<
@@ -25,7 +33,18 @@ export default function App() {
   const [streamUrl, setStreamUrl] = useState<string>('');
   const [analysis, setAnalysis] = useState<ManifestAnalysis | null>(null);
 
-  // Selections state
+  // Persistent Presets State
+  const [presets, setPresets] = useState<Preset[]>(() => loadSavedPresets());
+  const [selectedPresetId, setSelectedPresetId] = useState<string>(() =>
+    getSavedSelectedPresetId(loadSavedPresets())
+  );
+
+  // Persistent Command Configuration State
+  const [commandConfig, setCommandConfig] = useState<CommandConfig>(() =>
+    loadSavedCommandConfig()
+  );
+
+  // Stream Selections state
   const [selections, setSelections] = useState<StreamSelections>({
     selectedVideoId: 'best',
     selectedAudioIds: [],
@@ -35,35 +54,77 @@ export default function App() {
     autoAllSubtitles: true,
   });
 
-  // Command configuration state
-  const [commandConfig, setCommandConfig] = useState<CommandConfig>({
-    binaryPath: 'N_m3u8DL-RE',
-    outputDir: './downloads',
-    outputName: '{title}_{res}_{lang}',
-    muxer: 'ffmpeg',
-    containerFormat: 'mkv',
-    threadCount: 8,
-    concurrentDownload: 5,
-    maxSpeed: '0',
-    retryCount: 3,
-    checkSegmentsCount: true,
-    autoSelect: true,
-    keepTsFiles: false,
-    useShakaPackager: false,
-    shakaPackagerPath: '',
-    keys: [],
-    headers: [],
-    proxy: '',
-    customRawFlags: '',
-    customFfmpegFlags: '',
-  });
-
   // Active Jobs and Active Log Modal Job ID
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
   const [activeLogsJobId, setActiveLogsJobId] = useState<string | null>(null);
 
   // Derive active modal job from jobs array
   const activeLogsJob = jobs.find((j) => j.id === activeLogsJobId) || null;
+
+  // Active preset object
+  const activePreset =
+    presets.find((p) => p.id === selectedPresetId) || presets[0];
+
+  // Helper to update command config and persist to localStorage
+  const handleUpdateCommandConfig: React.Dispatch<
+    React.SetStateAction<CommandConfig>
+  > = (action) => {
+    setCommandConfig((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      saveCommandConfig(next);
+      return next;
+    });
+  };
+
+  // Select Preset Handler (syncs config, selections, and localStorage)
+  const handleSelectPreset = (presetId: string) => {
+    const target = presets.find((p) => p.id === presetId);
+    if (!target) return;
+
+    setSelectedPresetId(presetId);
+    saveSelectedPresetId(presetId);
+
+    if (target.config) {
+      setCommandConfig((prev) => {
+        const next = { ...prev, ...target.config };
+        saveCommandConfig(next);
+        return next;
+      });
+    }
+
+    if (target.selections) {
+      setSelections((prev) => ({
+        ...prev,
+        ...target.selections,
+      }));
+    }
+  };
+
+  // Save Preset Handler (create or update)
+  const handleSavePreset = (presetToSave: Preset) => {
+    setPresets((prev) => {
+      const exists = prev.some((p) => p.id === presetToSave.id);
+      const updated = exists
+        ? prev.map((p) => (p.id === presetToSave.id ? presetToSave : p))
+        : [presetToSave, ...prev];
+      savePresets(updated);
+      return updated;
+    });
+
+    handleSelectPreset(presetToSave.id);
+  };
+
+  // Delete Preset Handler
+  const handleDeletePreset = (presetId: string) => {
+    setPresets((prev) => {
+      const updated = prev.filter((p) => p.id !== presetId);
+      savePresets(updated);
+      if (selectedPresetId === presetId && updated.length > 0) {
+        handleSelectPreset(updated[0].id);
+      }
+      return updated;
+    });
+  };
 
   // Stable Single EventSource SSE Stream for all active jobs
   useEffect(() => {
@@ -109,10 +170,10 @@ export default function App() {
       if (eventSource) eventSource.close();
       if (fallbackPoll) clearInterval(fallbackPoll);
     };
-  }, []); // Empty dependency array -> Created ONCE on mount
+  }, []);
 
-  // Launch Download Runner Task
-  const handleStartDownload = async () => {
+  // Launch Download Runner Task (supports optional explicit edited command from Command Editor)
+  const handleStartDownload = async (customCommand?: string) => {
     if (!analysis) return;
 
     const plan = buildDownloadJobPlan({
@@ -121,6 +182,7 @@ export default function App() {
       analysis,
       selections,
       config: commandConfig,
+      explicitCommand: customCommand,
     });
 
     try {
@@ -162,22 +224,6 @@ export default function App() {
     }
   };
 
-  // Load Preset Handler
-  const handleLoadPreset = (preset: Preset) => {
-    if (preset.config) {
-      setCommandConfig((prev) => ({
-        ...prev,
-        ...preset.config,
-      }));
-    }
-    if (preset.selections && analysis) {
-      setSelections((prev) => ({
-        ...prev,
-        ...preset.selections,
-      }));
-    }
-  };
-
   const activeJobCount = jobs.filter(
     (j) => j.status.includes('downloading') || j.status === 'muxing'
   ).length;
@@ -203,10 +249,14 @@ export default function App() {
             selections={selections}
             setSelections={setSelections}
             commandConfig={commandConfig}
-            setCommandConfig={setCommandConfig}
-            onStartDownload={handleStartDownload}
+            setCommandConfig={handleUpdateCommandConfig}
+            presets={presets}
+            selectedPresetId={selectedPresetId}
+            onSelectPreset={handleSelectPreset}
+            onStartDownload={() => handleStartDownload()}
             onPreviewInPlayer={() => setActiveTab('player')}
             onGoToBuilder={() => setActiveTab('builder')}
+            onGoToPresets={() => setActiveTab('history')}
           />
         )}
 
@@ -215,7 +265,7 @@ export default function App() {
             streamUrl={streamUrl}
             analysis={analysis}
             selections={selections}
-            onStartDownload={handleStartDownload}
+            onStartDownload={() => handleStartDownload()}
           />
         )}
 
@@ -224,8 +274,9 @@ export default function App() {
             analysis={analysis}
             selections={selections}
             commandConfig={commandConfig}
-            setCommandConfig={setCommandConfig}
-            onStartDownload={handleStartDownload}
+            activePresetName={activePreset?.name}
+            onStartDownload={(cmd) => handleStartDownload(cmd)}
+            onGoToPresets={() => setActiveTab('history')}
           />
         )}
 
@@ -241,9 +292,13 @@ export default function App() {
         {activeTab === 'history' && (
           <PresetsAndHistory
             commandConfig={commandConfig}
-            setCommandConfig={setCommandConfig}
+            setCommandConfig={handleUpdateCommandConfig}
+            presets={presets}
+            selectedPresetId={selectedPresetId}
+            onSelectPreset={handleSelectPreset}
+            onSavePreset={handleSavePreset}
+            onDeletePreset={handleDeletePreset}
             jobs={jobs}
-            onLoadPreset={handleLoadPreset}
           />
         )}
       </main>
