@@ -2,6 +2,8 @@
 
 Stream Downloader & Muxer Web Interface for **N_m3u8DL-RE** and **FFmpeg**.
 
+<img width="1737" height="961" alt="image" src="https://github.com/user-attachments/assets/57f4be6d-1497-485c-aeed-1b4922c63234" />
+
 ## Features
 
 - **Stream Manifest Analyzer**: Probe HLS (`.m3u8`), DASH (`.mpd`), and MSS (`.ism`) streams over HTTP to inspect resolutions, bitrates, audio languages, and subtitle tracks.
