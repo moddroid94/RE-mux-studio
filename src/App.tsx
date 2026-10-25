@@ -224,6 +224,23 @@ export default function App() {
     }
   };
 
+  // Delete Job and Output File from Disk
+  const handleDeleteJob = async (jobId: string) => {
+    try {
+      const res = await fetch('/api/download/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setJobs((prev) => prev.filter((j) => j.id !== jobId));
+      }
+    } catch (err) {
+      console.error('Job deletion failed:', err);
+    }
+  };
+
   const activeJobCount = jobs.filter(
     (j) => j.status.includes('downloading') || j.status === 'muxing'
   ).length;
@@ -284,6 +301,7 @@ export default function App() {
           <DownloadManager
             jobs={jobs}
             onControlJob={handleControlJob}
+            onDeleteJob={handleDeleteJob}
             onOpenLogs={(job) => setActiveLogsJobId(job.id)}
             onNewStreamClick={() => setActiveTab('analyzer')}
           />

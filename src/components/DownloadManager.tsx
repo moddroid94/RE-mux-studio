@@ -13,6 +13,7 @@ import {
   Play,
   Sparkles,
   Terminal,
+  Trash2,
   XCircle
 } from 'lucide-react';
 import React, { useState } from 'react';
@@ -21,6 +22,7 @@ import { DownloadJob } from '../types/stream';
 interface DownloadManagerProps {
   jobs: DownloadJob[];
   onControlJob: (jobId: string, action: 'pause' | 'resume' | 'cancel') => void;
+  onDeleteJob: (jobId: string) => void;
   onOpenLogs: (job: DownloadJob) => void;
   onNewStreamClick: () => void;
 }
@@ -28,6 +30,7 @@ interface DownloadManagerProps {
 export const DownloadManager: React.FC<DownloadManagerProps> = ({
   jobs,
   onControlJob,
+  onDeleteJob,
   onOpenLogs,
   onNewStreamClick,
 }) => {
@@ -35,6 +38,7 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
   const [expandedJobIds, setExpandedJobIds] = useState<Record<string, boolean>>({});
   const [copiedCommandId, setCopiedCommandId] = useState<string | null>(null);
   const [copiedUrlId, setCopiedUrlId] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   const toggleJobDetails = (id: string) => {
     setExpandedJobIds((prev) => ({
@@ -53,6 +57,16 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
     navigator.clipboard.writeText(url);
     setCopiedUrlId(id);
     setTimeout(() => setCopiedUrlId(null), 2000);
+  };
+
+  const handleDeleteClick = (id: string) => {
+    if (confirmDeleteId === id) {
+      onDeleteJob(id);
+      setConfirmDeleteId(null);
+    } else {
+      setConfirmDeleteId(id);
+      setTimeout(() => setConfirmDeleteId((prev) => (prev === id ? null : prev)), 4000);
+    }
   };
 
   const filteredJobs = jobs.filter((j) => {
@@ -284,6 +298,19 @@ export const DownloadManager: React.FC<DownloadManagerProps> = ({
                         <FileVideo className="w-3.5 h-3.5" /> Download Muxed File
                       </a>
                     )}
+
+                    <button
+                      onClick={() => handleDeleteClick(job.id)}
+                      title="Delete job and remove file from disk"
+                      className={`px-3 py-1.5 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-all ${
+                        confirmDeleteId === job.id
+                          ? 'bg-red-600 hover:bg-red-500 text-white animate-pulse shadow-lg shadow-red-600/30 border border-red-500'
+                          : 'text-red-400 hover:text-red-300 bg-slate-800 hover:bg-slate-700 border border-slate-700'
+                      }`}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>{confirmDeleteId === job.id ? 'Confirm Delete?' : 'Delete Job & File'}</span>
+                    </button>
                   </div>
                 </div>
 

@@ -1160,6 +1160,53 @@ async function startServer() {
     return res.json({ success: true, job: item.job });
   });
 
+  // Delete Job & Disk File Endpoint
+  app.post('/api/download/delete', (req: Request, res: Response) => {
+    const { jobId } = req.body;
+    if (!jobId || typeof jobId !== 'string') {
+      return res.status(400).json({ error: 'Job ID is required' });
+    }
+
+    const item = activeJobsStore.get(jobId);
+    if (!item) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // 1. Kill active process if running
+    if (item.process) {
+      try {
+        item.process.kill('SIGKILL');
+      } catch (e) {}
+    }
+    if (item.intervalTimer) {
+      clearInterval(item.intervalTimer);
+    }
+
+    // 2. Remove output file from disk if present
+    const outputFile = item.job.outputFile;
+    if (outputFile) {
+      const baseName = path.basename(outputFile);
+      const filePath = path.join(DOWNLOADS_DIR, baseName);
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          console.log(`[Delete Job] Deleted file from disk: ${filePath}`);
+        }
+      } catch (err: any) {
+        console.warn(`[Delete Job] Failed to delete file ${filePath}:`, err.message);
+      }
+    }
+
+    // 3. Purge job from memory store and listener map
+    activeJobsStore.delete(jobId);
+    jobProgressListenerMap.delete(jobId);
+
+    // 4. Broadcast global progress SSE update
+    broadcastGlobalJobs(true);
+
+    return res.json({ success: true, deletedJobId: jobId });
+  });
+
   // HLS/DASH proxy
   app.get('/api/proxy', async (req: Request, res: Response) => {
     const targetUrl = req.query.url as string;
